@@ -272,11 +272,18 @@
             this._aspectRatio = 'auto';
             this._mpvTrackList = [];       // raw MPV track-list from property observer
             this._trackMap = new Map();    // jellyfinIndex -> mpvTrackId
+            this._isTransitioning = false; // true between loadfile and file-loaded
+            this._startedAt = 0;           // timestamp when _started became true
 
             // ================================================================
             // Event handlers (bound to this instance)
             // ================================================================
             this.onEnded = () => {
+                // Don't process EOF if we're in the middle of switching files
+                if (this._isTransitioning) {
+                    trace('onEnded() suppressed — file transition in progress');
+                    return;
+                }
                 this.onEndedInternal();
             };
 
@@ -289,9 +296,11 @@
             };
 
             this.onPlaying = () => {
-                trace('onPlaying() fired, _started=' + this._started);
+                trace('onPlaying() fired, _started=' + this._started + ' _isTransitioning=' + this._isTransitioning);
+                this._isTransitioning = false; // file has loaded, transition complete
                 if (!this._started) {
                     this._started = true;
+                    this._startedAt = Date.now();
                     this.loading.hide();
 
                     const volume = this.getSavedVolume() * 100;
@@ -383,6 +392,19 @@
                             break;
                         case 'eof-reached':
                             if (mpvEvent.data === true) {
+                                // Guard: only act on EOF if playback has actually started
+                                // and we're not mid-transition between files.
+                                // Also ignore spurious EOF within 1.5s of file-loaded
+                                // (can happen with HLS streams before segments arrive)
+                                if (!this._started || this._isTransitioning) {
+                                    trace('eof-reached suppressed — _started=' + this._started + ' _isTransitioning=' + this._isTransitioning);
+                                    break;
+                                }
+                                const timeSinceStart = Date.now() - (this._startedAt || 0);
+                                if (timeSinceStart < 1500 && (!this._currentTime || this._currentTime < 1000)) {
+                                    console.warn('[MPV] Ignoring rapid eof-reached (' + timeSinceStart + 'ms since file-loaded, pos=' + this._currentTime + ') — likely HLS buffering');
+                                    break;
+                                }
                                 this.onEnded();
                             }
                             break;
@@ -436,7 +458,11 @@
                         this.events.trigger(this, 'playing');
                     }
                 } else if (mpvEvent.event === 'end-file') {
-                    if (mpvEvent.reason === 'error') {
+                    // During file transitions (loadfile replacing old file),
+                    // end-file fires for the OLD file — ignore it entirely.
+                    if (this._isTransitioning) {
+                        trace('end-file suppressed during transition (reason=' + mpvEvent.reason + ')');
+                    } else if (mpvEvent.reason === 'error') {
                         this.onError(mpvEvent.error || 'Unknown playback error');
                     }
                     // 'eof' reason is handled via eof-reached property
@@ -749,6 +775,7 @@
             this._started = false;
             this._timeUpdated = false;
             this._currentTime = null;
+            this._isTransitioning = true; // protect against stale events until file-loaded
             this.resetSubtitleOffset();
 
             if (options.fullscreen) {
@@ -1130,6 +1157,7 @@
         }
 
         onEndedInternal() {
+            trace('onEndedInternal() _isTransitioning=' + this._isTransitioning + ' _currentSrc=' + (this._currentSrc || '(none)').slice(-60));
             const stopInfo = {
                 src: this._currentSrc
             };
@@ -1139,9 +1167,11 @@
             this._currentTime = null;
             this._currentSrc = null;
             this._currentPlayOptions = null;
+            this._isTransitioning = false;
         }
 
         stop(destroyPlayer) {
+            this._isTransitioning = false; // cancel any pending transition
             mpv.command('stop').catch(() => {});
             this.onEndedInternal();
 
