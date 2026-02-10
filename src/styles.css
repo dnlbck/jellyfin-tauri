@@ -1,0 +1,127 @@
+:root {
+  --jf-primary: #00a4dc;
+  --jf-primary-dark: #0086b3;
+  --jf-bg: #101010;
+  --jf-surface: #1a1a1a;
+  --jf-text: #ffffff;
+  --jf-text-muted: #999999;
+  --jf-border: #333333;
+  --jf-error: #ff4444;
+  --jf-success: #44bb44;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body {
+  height: 100%;
+  width: 100%;
+  background: var(--jf-bg);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  color: var(--jf-text);
+  overflow: hidden;
+}
+
+#app {
+  height: 100%;
+  width: 100%;
+}
+
+#connect-screen {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  width: 100%;
+  background: var(--jf-bg);
+}
+
+.connect-box {
+  text-align: center;
+  padding: 3rem;
+  background: var(--jf-surface);
+  border-radius: 12px;
+  border: 1px solid var(--jf-border);
+  max-width: 420px;
+  width: 90%;
+}
+
+.connect-box h1 {
+  font-size: 1.6rem;
+  font-weight: 600;
+  margin-bottom: 0.25rem;
+  color: var(--jf-primary);
+}
+
+.subtitle {
+  color: var(--jf-text-muted);
+  font-size: 0.9rem;
+  margin-bottom: 1.5rem;
+}
+
+#connect-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+#server-url {
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--jf-border);
+  border-radius: 6px;
+  background: var(--jf-bg);
+  color: var(--jf-text);
+  font-size: 1rem;
+  outline: none;
+  transition: border-color 0.2s;
+}
+
+#server-url:focus {
+  border-color: var(--jf-primary);
+}
+
+#server-url::placeholder {
+  color: var(--jf-text-muted);
+}
+
+#connect-btn {
+  padding: 0.75rem 1.5rem;
+  background: var(--jf-primary);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  font-size: 1rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+#connect-btn:hover {
+  background: var(--jf-primary-dark);
+}
+
+#connect-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.status {
+  margin-top: 0.75rem;
+  font-size: 0.85rem;
+  min-height: 1.2em;
+}
+
+.status.error {
+  color: var(--jf-error);
+}
+
+.status.success {
+  color: var(--jf-success);
+}
+
+.status.info {
+  color: var(--jf-text-muted);
+}

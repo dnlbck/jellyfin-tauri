@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Jellyfin Desktop</title>
+  <link rel="stylesheet" href="/src/styles.css" />
+</head>
+<body>
+  <div id="app">
+    <div id="connect-screen">
+      <div class="connect-box">
+        <h1>Jellyfin Desktop</h1>
+        <p class="subtitle">Connect to your Jellyfin server</p>
+        <form id="connect-form">
+          <input
+            type="url"
+            id="server-url"
+            placeholder="http://your-server:8096"
+            autocomplete="url"
+            required
+          />
+          <button type="submit" id="connect-btn">Connect</button>
+        </form>
+        <p id="status-msg" class="status"></p>
+      </div>
+    </div>
+  </div>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
