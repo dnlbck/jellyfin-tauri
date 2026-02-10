@@ -51,6 +51,9 @@
 
                 this.initializing = (async () => {
                     try {
+                        // Only include options known to be safe across all libmpv versions.
+                        // Risky/version-dependent options are applied post-init via setProperty
+                        // so a single bad option cannot hang the entire init call.
                         const config = {
                             initialOptions: {
                                 'vo': 'gpu-next',
@@ -59,6 +62,8 @@
                                 'slang': '',              // don't auto-select subs — we manage this
                                 'blend-subtitles': 'video', // burn subs into video frame (required for wid overlay)
                                 'sub-visibility': 'yes',  // ensure subtitle rendering is enabled
+                                'osd-level': '0',         // suppress mpv native OSD over jellyfin-web UI
+                                'ytdl': 'no',             // disable yt-dlp hook
                             },
                             observedProperties: {
                                 'pause': 'flag',
@@ -81,10 +86,18 @@
                             config.initialOptions['vid'] = 'no';
                         }
 
-                        await invoke('plugin:libmpv|init', {
+                        console.log('[MPV] Calling plugin:libmpv|init ...');
+                        const initPromise = invoke('plugin:libmpv|init', {
                             mpvConfig: config,
                             windowLabel: MPV_WINDOW_LABEL,
                         });
+
+                        // Safety net: if the init IPC never resolves, don't spin forever
+                        const timeoutPromise = new Promise((_, reject) => {
+                            setTimeout(() => reject(new Error('[MPV] Init timed out after 15 seconds')), 15000);
+                        });
+                        await Promise.race([initPromise, timeoutPromise]);
+                        console.log('[MPV] plugin:libmpv|init resolved');
 
                         // Listen for all MPV events
                         this.eventUnlisten = await listen(
@@ -94,6 +107,22 @@
 
                         this.initialized = true;
                         console.log('[MPV] Initialized successfully');
+
+                        // Apply version-dependent options post-init via setProperty.
+                        // Each is individually try/caught so failures are non-fatal.
+                        const postInitOptions = {
+                            'audio-fallback-to-null': 'yes',
+                            'ad-lavc-downmix': 'no',
+                            'audio-client-name': 'Jellyfin Desktop',
+                            'demuxer-lavf-probe-info': 'yes',
+                        };
+                        for (const [key, val] of Object.entries(postInitOptions)) {
+                            try {
+                                await this.setProperty(key, val);
+                            } catch (e) {
+                                console.warn('[MPV] Post-init option not supported:', key, e);
+                            }
+                        }
                     } catch (e) {
                         console.error('[MPV] Init failed:', e);
                         throw e;
@@ -413,6 +442,16 @@
                     // 'eof' reason is handled via eof-reached property
                 }
             };
+
+            // Live subtitle settings — re-apply when user changes settings mid-playback
+            const self = this;
+            window.jmpInfo.settingsUpdate.push((section) => {
+                if (section === 'subtitles' && self._started) {
+                    self._applySubtitleSettings().catch(e => {
+                        console.warn('[MPV] Failed to live-update subtitle settings:', e);
+                    });
+                }
+            });
         }
 
         /**
@@ -462,6 +501,167 @@
             return this._currentSrc;
         }
 
+        /**
+         * Apply audio configuration settings (device, channels, passthrough, etc.)
+         * from jmpInfo.settings.audio to the MPV instance. Called once per play().
+         */
+        async _applyAudioSettings() {
+            const audioSettings = window.jmpInfo?.settings?.audio;
+            if (!audioSettings) return;
+
+            const mgr = window.__mpvManager;
+
+            // Exclusive mode (WASAPI exclusive on Windows)
+            if (audioSettings.exclusive) {
+                await mgr.setProperty('audio-exclusive', 'yes');
+            } else {
+                await mgr.setProperty('audio-exclusive', 'no');
+            }
+
+            // Normalize downmix volume
+            if (audioSettings.normalize) {
+                await mgr.setProperty('audio-normalize-downmix', 'yes');
+                await mgr.setProperty('audio-swresample-o', 'surround_mix_level=1');
+            } else {
+                await mgr.setProperty('audio-normalize-downmix', 'no');
+            }
+
+            // Passthrough — build comma-separated codec list for audio-spdif
+            const passthrough = [];
+            if (audioSettings.passthrough_ac3)    passthrough.push('ac3');
+            if (audioSettings.passthrough_dts)    passthrough.push('dts');
+            if (audioSettings.passthrough_eac3)   passthrough.push('eac3');
+            if (audioSettings.passthrough_dtshd)  passthrough.push('dts-hd');
+            if (audioSettings.passthrough_truehd) passthrough.push('truehd');
+            if (passthrough.length > 0) {
+                await mgr.setProperty('audio-spdif', passthrough.join(','));
+                console.log('[MPV] Audio passthrough enabled for:', passthrough.join(','));
+            } else {
+                await mgr.setProperty('audio-spdif', '');
+            }
+
+            // Audio channels
+            const channelMap = { 'auto': 'auto', '2.0': 'stereo', '5.1': '5.1', '7.1': '7.1' };
+            const channels = channelMap[audioSettings.channels] || 'auto';
+            // If passthrough is active and channels is auto, force stereo for non-passthrough content
+            if (passthrough.length > 0 && audioSettings.channels === 'auto') {
+                await mgr.setProperty('audio-channels', 'stereo');
+                console.log('[MPV] Audio channels forced to stereo (passthrough active, channels=auto)');
+            } else {
+                await mgr.setProperty('audio-channels', channels);
+            }
+
+            // Audio device
+            if (audioSettings.device && audioSettings.device !== 'auto') {
+                await mgr.setProperty('audio-device', audioSettings.device);
+                console.log('[MPV] Audio device set to:', audioSettings.device);
+            }
+
+            console.log('[MPV] Audio settings applied:', {
+                exclusive: audioSettings.exclusive,
+                normalize: audioSettings.normalize,
+                passthrough: passthrough.join(',') || 'none',
+                channels: audioSettings.channels,
+                device: audioSettings.device,
+            });
+        }
+
+        /**
+         * Apply subtitle appearance settings from jmpInfo.settings.subtitles
+         * to the MPV instance. Called once per play() and on live settings changes.
+         */
+        async _applySubtitleSettings() {
+            const subSettings = window.jmpInfo?.settings?.subtitles;
+            if (!subSettings) return;
+
+            const mgr = window.__mpvManager;
+
+            if (subSettings.size) {
+                await mgr.setProperty('sub-font-size', subSettings.size);
+            }
+            if (subSettings.font) {
+                await mgr.setProperty('sub-font', subSettings.font);
+            }
+            if (subSettings.color) {
+                await mgr.setProperty('sub-color', subSettings.color);
+            }
+            if (subSettings.border_color) {
+                await mgr.setProperty('sub-border-color', subSettings.border_color);
+            }
+            if (subSettings.border_size !== undefined) {
+                await mgr.setProperty('sub-border-size', subSettings.border_size);
+            }
+            if (subSettings.background_color) {
+                await mgr.setProperty('sub-back-color', subSettings.background_color);
+            }
+            if (subSettings.ass_style_override) {
+                await mgr.setProperty('sub-ass-override', subSettings.ass_style_override);
+            }
+            if (subSettings.ass_scale_border !== undefined) {
+                const val = subSettings.ass_scale_border
+                    ? 'ScaledBorderAndShadow=yes'
+                    : 'ScaledBorderAndShadow=no';
+                await mgr.setProperty('sub-ass-style-overrides', val);
+            }
+
+            console.log('[MPV] Subtitle settings applied:', {
+                size: subSettings.size,
+                font: subSettings.font || '(default)',
+                color: subSettings.color,
+                border_color: subSettings.border_color,
+                border_size: subSettings.border_size,
+                background_color: subSettings.background_color,
+                ass_style_override: subSettings.ass_style_override,
+                ass_scale_border: subSettings.ass_scale_border,
+            });
+        }
+
+        /**
+         * Apply advanced video settings from jmpInfo.settings.video
+         * to the MPV instance: hardware decoding, deinterlace, sync mode,
+         * cache size, and audio delay.
+         */
+        async _applyVideoSettings() {
+            const vs = window.jmpInfo?.settings?.video;
+            if (!vs) return;
+
+            const mgr = window.__mpvManager;
+
+            if (vs.hardwareDecoding) {
+                await mgr.setProperty('hwdec', vs.hardwareDecoding);
+            }
+
+            if (vs.deinterlace) {
+                await mgr.setProperty('deinterlace', 'yes');
+            } else {
+                await mgr.setProperty('deinterlace', 'no');
+            }
+
+            if (vs.sync_mode && vs.sync_mode !== 'audio') {
+                await mgr.setProperty('video-sync', vs.sync_mode);
+            } else {
+                await mgr.setProperty('video-sync', 'audio');
+            }
+
+            if (vs.cache_mb) {
+                const bytes = parseInt(vs.cache_mb, 10) * 1024 * 1024;
+                await mgr.setProperty('demuxer-max-bytes', String(bytes));
+            }
+
+            if (vs.audio_delay_ms && vs.audio_delay_ms !== '0') {
+                const secs = parseInt(vs.audio_delay_ms, 10) / 1000;
+                await mgr.setProperty('audio-delay', String(secs));
+            } else {
+                await mgr.setProperty('audio-delay', '0');
+            }
+
+            trace('_applyVideoSettings() applied: hwdec=' + (vs.hardwareDecoding || 'auto-safe') +
+                  ' deinterlace=' + !!vs.deinterlace +
+                  ' sync=' + (vs.sync_mode || 'audio') +
+                  ' cache=' + (vs.cache_mb || '150') + 'MB' +
+                  ' audioDelay=' + (vs.audio_delay_ms || '0') + 'ms');
+        }
+
         async play(options) {
             trace('play() CALLED — url=' + (options.url || '(none)').slice(-80));
             trace('play() options keys: ' + Object.keys(options).join(','));
@@ -479,6 +679,13 @@
             if (options.mediaSource && options.mediaSource.MediaStreams) {
                 for (const stream of options.mediaSource.MediaStreams) {
                     if (stream.Type === 'Subtitle') {
+                        // Save original external delivery info for our own use
+                        // before we mask it from jellyfin-web
+                        stream._originalIsExternal = stream.IsExternal;
+                        stream._originalDeliveryUrl = stream.DeliveryUrl;
+                        stream._originalDeliveryMethod = stream.DeliveryMethod;
+                        // Prevent jellyfin-web from handling text subs or
+                        // intercepting external subtitle delivery
                         stream.IsTextSubtitleStream = false;
                         stream.IsExternal = false;
                         if (stream.DeliveryMethod === 'External') {
@@ -579,7 +786,7 @@
         getRelativeIndexByType(mediaStreams, jellyIndex, streamType) {
             let relIndex = 1;
             for (const source of mediaStreams) {
-                if (source.Type !== streamType || source.IsExternal) {
+                if (source.Type !== streamType || (source._originalIsExternal ?? source.IsExternal)) {
                     continue;
                 }
                 if (source.Index == jellyIndex) {
@@ -629,7 +836,7 @@
             const jellyTypeMap = { 'Audio': 'audio', 'Subtitle': 'sub', 'Video': 'video' };
 
             for (const [jellyType, mpvType] of Object.entries(jellyTypeMap)) {
-                const jellyStreams = mediaStreams.filter(s => s.Type === jellyType && !s.IsExternal);
+                const jellyStreams = mediaStreams.filter(s => s.Type === jellyType && !(s._originalIsExternal ?? s.IsExternal));
                 const mpvTracks = mpvByType[mpvType] || [];
 
                 // Strategy 1: If counts match, assume same order
@@ -683,6 +890,27 @@
             // Ensure MPV is initialized (video mode)
             await mpv.ensureInit(false);
 
+            // Apply audio configuration settings (device, passthrough, channels, etc.)
+            try {
+                await this._applyAudioSettings();
+            } catch (e) {
+                console.warn('[MPV] Failed to apply audio settings:', e);
+            }
+
+            // Apply subtitle appearance settings (size, color, font, etc.)
+            try {
+                await this._applySubtitleSettings();
+            } catch (e) {
+                console.warn('[MPV] Failed to apply subtitle settings:', e);
+            }
+
+            // Apply advanced video settings (hwdec, deinterlace, sync, cache, audio delay)
+            try {
+                await this._applyVideoSettings();
+            } catch (e) {
+                console.warn('[MPV] Failed to apply video settings:', e);
+            }
+
             // Stash pending track selections — applied after file-loaded event
             this._pendingSubtitleSetup = null;
             this._pendingAudioSetup = null;
@@ -701,28 +929,24 @@
             }
 
             // Prepare subtitle track
+            // NOTE: play() patches stream.DeliveryMethod/IsExternal to hide
+            // external subs from jellyfin-web. Use _original* fields here.
             if (this._subtitleTrackIndexToSetOnPlaying >= 0) {
                 const subStream = this.getStreamByIndex(streams, this._subtitleTrackIndexToSetOnPlaying);
-                if (subStream && subStream.DeliveryMethod === 'External' && subStream.DeliveryUrl) {
+                const origIsExternal = subStream && (subStream._originalIsExternal ?? subStream.IsExternal);
+                const origDeliveryUrl = subStream && (subStream._originalDeliveryUrl ?? subStream.DeliveryUrl);
+                const origDeliveryMethod = subStream && (subStream._originalDeliveryMethod ?? subStream.DeliveryMethod);
+                if (origIsExternal && origDeliveryUrl) {
                     // External subtitle — will add via sub-add after file loads
-                    let subUrl = subStream.DeliveryUrl;
-                    console.log('[MPV] Will load external subtitle URL:', subUrl);
-                    this._pendingSubtitleSetup = { type: 'external', url: subUrl };
-                } else if (subStream && subStream.DeliveryMethod === 'Embed') {
+                    console.log('[MPV] Will load external subtitle URL:', origDeliveryUrl);
+                    this._pendingSubtitleSetup = { type: 'external', url: origDeliveryUrl };
+                } else {
                     // Embedded subtitle — use relative index within container
                     const relIndex = this.getRelativeIndexByType(
                         streams, this._subtitleTrackIndexToSetOnPlaying, 'Subtitle'
                     );
                     console.log('[MPV] Will set embedded subtitle index:',
                         this._subtitleTrackIndexToSetOnPlaying, '->', relIndex);
-                    if (relIndex != null) {
-                        this._pendingSubtitleSetup = { type: 'embedded', sid: relIndex };
-                    }
-                } else {
-                    // Fallback: try embedded index anyway
-                    const relIndex = this.getRelativeIndexByType(
-                        streams, this._subtitleTrackIndexToSetOnPlaying, 'Subtitle'
-                    );
                     if (relIndex != null) {
                         this._pendingSubtitleSetup = { type: 'embedded', sid: relIndex };
                     }
@@ -758,8 +982,10 @@
                 } else {
                     const streams = this._currentPlayOptions?.mediaSource?.MediaStreams || [];
                     const stream = this.getStreamByIndex(streams, index);
-                    if (stream && stream.DeliveryMethod === 'External' && stream.DeliveryUrl) {
-                        this._pendingSubtitleSetup = { type: 'external', url: stream.DeliveryUrl };
+                    const pendingIsExternal = stream && (stream._originalIsExternal ?? stream.IsExternal);
+                    const pendingDeliveryUrl = stream && (stream._originalDeliveryUrl ?? stream.DeliveryUrl);
+                    if (pendingIsExternal && pendingDeliveryUrl) {
+                        this._pendingSubtitleSetup = { type: 'external', url: pendingDeliveryUrl };
                     } else {
                         const relIndex = this._resolveTrackId(index, 'Subtitle');
                         if (relIndex != null) {
@@ -783,8 +1009,12 @@
             const streams = this._currentPlayOptions?.mediaSource?.MediaStreams || [];
             const stream = this.getStreamByIndex(streams, index);
 
-            if (stream && stream.DeliveryMethod === 'External' && stream.DeliveryUrl) {
-                let subUrl = stream.DeliveryUrl;
+            const isExternal = stream && (stream._originalIsExternal ?? stream.IsExternal);
+            const deliveryUrl = stream && (stream._originalDeliveryUrl ?? stream.DeliveryUrl);
+            const deliveryMethod = stream && (stream._originalDeliveryMethod ?? stream.DeliveryMethod);
+
+            if (isExternal && deliveryUrl) {
+                let subUrl = deliveryUrl;
                 console.log('[MPV] Loading external subtitle:', subUrl);
                 // 'select' flag makes mpv immediately activate this subtitle
                 mpv.command('sub-add', [subUrl, 'select']).then(() => {

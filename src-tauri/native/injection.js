@@ -135,18 +135,45 @@
         // via tauri-plugin-libmpv (invoke('plugin:libmpv|...')). This shim provides
         // compatibility stubs for any code that still references window.api.player.
         player: {
-            // Outbound notifications (JS → Rust, informational — no-ops for now)
-            notifyMetadata:       (item, serverUrl) => {},
-            notifyPosition:       (ms)              => {},
-            notifyDurationChange: (ms)              => {},
-            notifyPlaybackState:  (state)           => {},
+            // Outbound notifications (JS → Rust) — update OS media controls (SMTC/MPRIS)
+            notifyMetadata: (item, serverUrl) => {
+                const title = item.Name || '';
+                const artist = item.ArtistItems?.[0]?.Name || item.SeriesName || '';
+                const album = item.Album || '';
+                const coverUrl = item.Id
+                    ? `${serverUrl}/Items/${item.Id}/Images/Primary?maxHeight=300`
+                    : null;
+                const durationMs = item.RunTimeTicks
+                    ? Math.round(item.RunTimeTicks / 10000)
+                    : null;
+                return invoke('media_notify_metadata', {
+                    title, artist, album, coverUrl, durationMs,
+                }).catch(() => {});
+            },
+            notifyPosition: (ms) => {
+                invoke('media_notify_position', {
+                    positionMs: Math.round(ms),
+                }).catch(() => {});
+            },
+            notifyDurationChange: (ms) => {},
+            notifyPlaybackState: (state) => {
+                return invoke('media_notify_playback_state', {
+                    playing: state === 'Playing',
+                }).catch(() => {});
+            },
             notifyVolumeChange:   (vol)             => {},
             notifyRateChange:     (rate)            => {},
             notifyShuffleChange:  (enabled)         => {},
             notifyRepeatChange:   (mode)            => {},
             notifyQueueChange:    (canNext, canPrev) => {},
-            notifyPlaybackStop:   (isNavigating)    => {},
-            notifySeek:           (ms)              => {},
+            notifyPlaybackStop: (isNavigating) => {
+                return invoke('media_notify_stop').catch(() => {});
+            },
+            notifySeek: (ms) => {
+                invoke('media_notify_position', {
+                    positionMs: Math.round(ms),
+                }).catch(() => {});
+            },
 
             // Legacy signal stubs — kept for compatibility with any addons
             playing:             createSignal('player-playing'),
@@ -174,14 +201,70 @@
             setValue:  (section, key, val) => invoke('settings_set_value', { section, key, value: val }),
             value:     (section, key)      => invoke('settings_get_value', { section, key }),
             settingsValue: createSignal('settings-value-changed'),
+
+            // Batch write: options = { section: { key: value, ... }, ... }
+            setValues: (options) => invoke('settings_set_values', { values: options }),
+
+            // Reset a section to its defaults (from settingsDescriptions)
+            resetToDefault: async (section) => {
+                const descriptions = window.jmpInfo.settingsDescriptions[section];
+                if (!descriptions) return;
+                // Delete persisted keys for this section
+                await invoke('settings_delete_section', { section });
+                // Restore in-memory settings to defaults
+                for (const [key, desc] of Object.entries(descriptions)) {
+                    if (desc.default !== undefined) {
+                        await invoke('settings_set_value', { section, key, value: desc.default });
+                        if (window.jmpInfo.settings[section]) {
+                            window.jmpInfo.settings[section][key] = desc.default;
+                        }
+                    }
+                }
+                // Notify listeners
+                window.jmpInfo.settingsUpdate.forEach(fn => {
+                    try { fn(section); } catch (e) { /* ignore */ }
+                });
+            },
+
+            // Reset all sections to defaults
+            resetToDefaultAll: async () => {
+                for (const section of Object.keys(window.jmpInfo.settingsDescriptions)) {
+                    await window.api.settings.resetToDefault(section);
+                }
+            },
+
+            // Returns ordered section names
+            orderedSections: () => Promise.resolve(Object.keys(window.jmpInfo.settingsDescriptions)),
+
+            // Returns full setting descriptions
+            settingDescriptions: () => Promise.resolve(window.jmpInfo.settingsDescriptions),
         },
+
 
         system: {
             hello:                   (name) => invoke('system_hello', { name }),
             openExternalUrl:         (url)  => invoke('system_open_external_url', { url }),
             exit:                    ()     => invoke('system_exit'),
+            restart:                 ()     => invoke('system_restart'),
+            debugInformation:        ()     => invoke('system_debug_info'),
             checkForUpdates:         ()     => invoke('system_check_for_updates'),
             checkServerConnectivity: (url)  => invoke('check_server_connectivity', { url }),
+            cancelServerConnectivity:()     => Promise.resolve(),
+            getUserAgent:            ()     => Promise.resolve(navigator.userAgent),
+            getCapabilitiesString:   ()     => Promise.resolve(JSON.stringify({
+                PlayableMediaTypes: ['Audio', 'Video'],
+                SupportedCommands: [
+                    'MoveUp', 'MoveDown', 'MoveLeft', 'MoveRight', 'Select',
+                    'Back', 'ToggleFullscreen', 'GoHome', 'GoToSettings', 'TakeScreenshot',
+                    'VolumeUp', 'VolumeDown', 'ToggleMute', 'SetAudioStreamIndex',
+                    'SetSubtitleStreamIndex', 'Mute', 'Unmute', 'SetVolume',
+                    'PlayState', 'PlayNext', 'PlayPrevious'
+                ],
+                SupportsMediaControl: true,
+                SupportsPersistentIdentifier: true,
+            })),
+            networkAddresses:        ()     => Promise.resolve([]),
+            fetchPageForCSPWorkaround:(url) => Promise.resolve(''),
             updateInfoEmitted:       createSignal('system-update-info'),
             serverConnectivityResult:createSignal('system-server-connectivity-result'),
             pageContentReady:        createSignal('system-page-content-ready'),
@@ -201,8 +284,20 @@
         display: {},
 
         window: {
-            setFullscreen: (fs) => invoke('window_set_fullscreen', { fullscreen: fs }),
-            isFullscreen:  ()   => invoke('window_is_fullscreen'),
+            setFullscreen: (fs) => {
+                // Kiosk mode: block exiting fullscreen if forceAlwaysFS is enabled
+                if (!fs && window.jmpInfo?.settings?.main?.forceAlwaysFS) {
+                    console.log('[JellyfinTauri] Kiosk mode active — blocking fullscreen exit');
+                    return Promise.resolve();
+                }
+                return invoke('window_set_fullscreen', { fullscreen: fs });
+            },
+            isFullscreen:    ()        => invoke('window_is_fullscreen'),
+            setAlwaysOnTop:  (enabled) => invoke('window_set_always_on_top', { enabled }),
+            isAlwaysOnTop:   ()        => invoke('window_is_always_on_top'),
+            raise:           ()        => invoke('window_raise'),
+            setCursorVisible:(visible) => invoke('window_set_cursor_visible', { visible }),
+            saveGeometry:    ()        => invoke('window_save_geometry'),
         },
     };
 
@@ -238,11 +333,34 @@
                 default_playback_speed: 1,
                 aspect: 'auto',
             },
+            audio: {
+                device:             'auto',
+                channels:           'auto',
+                exclusive:          false,
+                normalize:          false,
+                passthrough_ac3:    false,
+                passthrough_dts:    false,
+                passthrough_eac3:   false,
+                passthrough_dtshd:  false,
+                passthrough_truehd: false,
+            },
+            subtitles: {
+                size:               '32',
+                font:               '',
+                color:              '#FFFFFFFF',
+                border_color:       '#FF000000',
+                border_size:        '2',
+                background_color:   '#00000000',
+                ass_style_override: 'yes',
+                ass_scale_border:   true,
+            },
         },
         settingsDescriptions: {
             main: {
-                fullscreen:    { type: 'bool', default: false, name: 'Fullscreen' },
-                alwaysOnTop:   { type: 'bool', default: false, name: 'Always on Top' },
+                fullscreen:      { type: 'bool', default: false, name: 'Fullscreen' },
+                alwaysOnTop:     { type: 'bool', default: false, name: 'Always on Top' },
+                forceAlwaysFS:   { type: 'bool', default: false, name: 'Kiosk Mode (prevent exiting fullscreen)' },
+                allowBrowserZoom:{ type: 'bool', default: false, name: 'Allow Browser Zoom' },
             },
             video: {
                 force_transcode_dovi:  { type: 'bool', default: false, name: 'Force transcode Dolby Vision' },
@@ -254,6 +372,39 @@
                 always_force_transcode: { type: 'bool', default: false, name: 'Always force transcoding' },
                 max_audio_channels:    { type: 'select', default: '6', name: 'Max audio channels', options: ['2', '6', '8'] },
                 default_playback_speed: { type: 'select', default: '1', name: 'Default playback speed', options: ['0.5', '0.75', '1', '1.25', '1.5', '1.75', '2'] },
+                hardwareDecoding:      { type: 'select', default: 'auto-safe', name: 'Hardware Decoding',
+                                         options: ['auto-safe', 'auto-copy', 'no'] },
+                deinterlace:           { type: 'bool', default: false, name: 'Deinterlace' },
+                sync_mode:             { type: 'select', default: 'audio', name: 'Video Sync Mode',
+                                         options: ['audio', 'display-resample', 'display-adrop'] },
+                cache_mb:              { type: 'select', default: '150', name: 'Cache Size (MB)',
+                                         options: ['10', '75', '150', '500'] },
+                audio_delay_ms:        { type: 'text', default: '0', name: 'Audio Delay (ms)' },
+                allow_transcode_to_hevc: { type: 'bool', default: false, name: 'Allow Transcode to HEVC' },
+            },
+            audio: {
+                device:             { type: 'select', default: 'auto', name: 'Audio Device', options: ['auto'] },
+                channels:           { type: 'select', default: 'auto', name: 'Audio Channels', options: ['auto', '2.0', '5.1', '7.1'] },
+                exclusive:          { type: 'bool', default: false, name: 'Exclusive Audio Mode (WASAPI)' },
+                normalize:          { type: 'bool', default: false, name: 'Normalize Downmix Volume' },
+                passthrough_ac3:    { type: 'bool', default: false, name: 'Passthrough AC3' },
+                passthrough_dts:    { type: 'bool', default: false, name: 'Passthrough DTS' },
+                passthrough_eac3:   { type: 'bool', default: false, name: 'Passthrough E-AC3' },
+                passthrough_dtshd:  { type: 'bool', default: false, name: 'Passthrough DTS-HD' },
+                passthrough_truehd: { type: 'bool', default: false, name: 'Passthrough TrueHD' },
+            },
+            subtitles: {
+                size:               { type: 'select', default: '32', name: 'Subtitle Size',
+                                      options: ['16', '20', '24', '28', '32', '36', '40', '48', '56', '64', '72'] },
+                font:               { type: 'text', default: '', name: 'Subtitle Font (blank = default)' },
+                color:              { type: 'text', default: '#FFFFFFFF', name: 'Subtitle Color (hex ARGB)' },
+                border_color:       { type: 'text', default: '#FF000000', name: 'Border Color (hex ARGB)' },
+                border_size:        { type: 'select', default: '2', name: 'Border Size',
+                                      options: ['0', '1', '2', '3', '4', '5', '6'] },
+                background_color:   { type: 'text', default: '#00000000', name: 'Background Color (hex ARGB)' },
+                ass_style_override: { type: 'select', default: 'yes', name: 'ASS Style Override',
+                                      options: ['yes', 'no', 'force', 'scale', 'strip'] },
+                ass_scale_border:   { type: 'bool', default: true, name: 'Scale ASS Border & Shadow' },
             },
         },
         settingsUpdate: [],
@@ -318,6 +469,40 @@
     }
 
     // ========================================================================
+    // Audio Device Enumeration — populates the audio device dropdown
+    // dynamically from MPV's audio-device-list after MPV is initialized.
+    // ========================================================================
+    async function populateAudioDeviceList() {
+        const mgr = window.__mpvManager;
+        if (!mgr || !mgr.initialized) return;
+
+        try {
+            const devices = await mgr.getProperty('audio-device-list', 'node');
+            if (Array.isArray(devices) && devices.length > 0) {
+                const options = ['auto'];
+                for (const dev of devices) {
+                    if (dev.name && !options.includes(dev.name)) {
+                        options.push(dev.name);
+                    }
+                }
+                // Update the settingsDescriptions so the modal shows the full list
+                if (window.jmpInfo?.settingsDescriptions?.audio?.device) {
+                    window.jmpInfo.settingsDescriptions.audio.device.options = options;
+                    // Build a display name map for the select UI
+                    window.jmpInfo._audioDeviceNames = {};
+                    window.jmpInfo._audioDeviceNames['auto'] = 'Auto';
+                    for (const dev of devices) {
+                        window.jmpInfo._audioDeviceNames[dev.name] = dev.description || dev.name;
+                    }
+                }
+                console.log('[JellyfinTauri] Audio device list populated:', options.length, 'devices');
+            }
+        } catch (e) {
+            console.warn('[JellyfinTauri] Failed to enumerate audio devices:', e);
+        }
+    }
+
+    // ========================================================================
     // Settings Modal — shows video/transcode settings when user opens
     // Client Settings from the jellyfin-web dashboard
     // ========================================================================
@@ -325,6 +510,9 @@
         // Toggle: remove if already open
         const existing = document.getElementById('jmp-settings-modal');
         if (existing) { existing.remove(); return; }
+
+        // Populate audio device list from MPV if available
+        populateAudioDeviceList();
 
         const sections = window.jmpInfo.settingsDescriptions || {};
         const settings = window.jmpInfo.settings || {};
@@ -373,10 +561,12 @@
                     row.appendChild(cb);
                 } else if (desc.type === 'select') {
                     const sel = document.createElement('select');
-                    sel.style.cssText = 'background:#333;color:#eee;border:1px solid #555;border-radius:4px;padding:4px 8px;font-size:0.9em;';
+                    sel.style.cssText = 'background:#333;color:#eee;border:1px solid #555;border-radius:4px;padding:4px 8px;font-size:0.9em;max-width:220px;';
+                    const deviceNames = (secName === 'audio' && key === 'device') ? (window.jmpInfo._audioDeviceNames || {}) : null;
                     for (const opt of (desc.options || [])) {
                         const o = document.createElement('option');
-                        o.value = opt; o.textContent = opt;
+                        o.value = opt;
+                        o.textContent = deviceNames ? (deviceNames[opt] || opt) : opt;
                         if (String(secSettings[key]) === String(opt)) o.selected = true;
                         sel.appendChild(o);
                     }
@@ -386,6 +576,18 @@
                         window.jmpInfo.settingsUpdate.forEach(fn => { try { fn(secName); } catch(e) {} });
                     });
                     row.appendChild(sel);
+                } else if (desc.type === 'text') {
+                    const inp = document.createElement('input');
+                    inp.type = 'text';
+                    inp.value = secSettings[key] != null ? String(secSettings[key]) : '';
+                    inp.placeholder = desc.default || '';
+                    inp.style.cssText = 'background:#333;color:#eee;border:1px solid #555;border-radius:4px;padding:4px 8px;font-size:0.9em;max-width:180px;width:100%;';
+                    inp.addEventListener('change', () => {
+                        settings[secName][key] = inp.value;
+                        window.api.settings.setValue(secName, key, inp.value).catch(() => {});
+                        window.jmpInfo.settingsUpdate.forEach(fn => { try { fn(secName); } catch(e) {} });
+                    });
+                    row.appendChild(inp);
                 }
                 panel.appendChild(row);
             }
@@ -397,15 +599,44 @@
 
         // Note about restart
         const note = document.createElement('p');
-        note.textContent = 'Transcode settings take effect on next playback.';
+        note.textContent = 'Transcode settings take effect on next playback. Audio & subtitle settings apply on next play (or live if playing).';
         note.style.cssText = 'margin:4px 0 16px;font-size:0.85em;color:#888;';
         panel.appendChild(note);
+
+        // Button row
+        const btnRow = document.createElement('div');
+        btnRow.style.cssText = 'display:flex;gap:10px;flex-wrap:wrap;';
 
         const closeBtn = document.createElement('button');
         closeBtn.textContent = 'Close';
         closeBtn.style.cssText = 'background:#00a4dc;color:#fff;border:none;border-radius:4px;padding:8px 28px;cursor:pointer;font-size:0.95em;';
         closeBtn.addEventListener('click', () => modal.remove());
-        panel.appendChild(closeBtn);
+        btnRow.appendChild(closeBtn);
+
+        const resetBtn = document.createElement('button');
+        resetBtn.textContent = 'Reset All to Defaults';
+        resetBtn.style.cssText = 'background:#555;color:#fff;border:none;border-radius:4px;padding:8px 18px;cursor:pointer;font-size:0.95em;';
+        resetBtn.addEventListener('click', async () => {
+            if (confirm('Reset all settings to defaults?')) {
+                await window.api.settings.resetToDefaultAll();
+                modal.remove();
+                showSettingsModal(); // re-open with fresh defaults
+            }
+        });
+        btnRow.appendChild(resetBtn);
+
+        const resetServerBtn = document.createElement('button');
+        resetServerBtn.textContent = 'Reset Saved Server';
+        resetServerBtn.style.cssText = 'background:#833;color:#fff;border:none;border-radius:4px;padding:8px 18px;cursor:pointer;font-size:0.95em;';
+        resetServerBtn.addEventListener('click', async () => {
+            if (confirm('Clear saved server URL and restart?')) {
+                await invoke('settings_set_value', { section: 'server', key: 'server_url', value: null });
+                await invoke('system_restart');
+            }
+        });
+        btnRow.appendChild(resetServerBtn);
+
+        panel.appendChild(btnRow);
 
         modal.appendChild(panel);
         modal.addEventListener('click', (e) => { if (e.target === modal) modal.remove(); });
@@ -456,8 +687,8 @@
                 {
                     Container: 'ts',
                     Type: 'Video',
-                    AudioCodec: 'aac,mp3,ac3,eac3',
-                    VideoCodec: 'h264',
+                    AudioCodec: 'aac,mp3,ac3,eac3,opus',
+                    VideoCodec: vs.allow_transcode_to_hevc ? 'hevc,h264' : 'h264',
                     Context: 'Streaming',
                     Protocol: 'hls',
                     MaxAudioChannels: maxCh,
@@ -479,20 +710,24 @@
             CodecProfiles: getCodecProfiles(),
 
             SubtitleProfiles: [
-                // Embed only — MPV reads subtitles directly from the container.
-                // We do NOT advertise 'External' delivery because jellyfin-web's
-                // playback manager intercepts External text subs and tries to
-                // render them via its own htmlVideoPlayer text track system,
-                // which crashes since we have no HTML video element.
-                // For Direct Play, all subs stay embedded in the container and
-                // MPV handles them natively via sid selection.
+                // Text formats: External + Embed
+                // External = server sends subtitle as a separate URL, mpv loads via sub-add
+                // Embed = subtitle is muxed into the container, mpv reads via sid
+                { Format: 'srt',    Method: 'External' },
                 { Format: 'srt',    Method: 'Embed' },
+                { Format: 'subrip', Method: 'External' },
                 { Format: 'subrip', Method: 'Embed' },
+                { Format: 'ass',    Method: 'External' },
                 { Format: 'ass',    Method: 'Embed' },
+                { Format: 'ssa',    Method: 'External' },
                 { Format: 'ssa',    Method: 'Embed' },
+                { Format: 'sub',    Method: 'External' },
                 { Format: 'sub',    Method: 'Embed' },
+                { Format: 'smi',    Method: 'External' },
                 { Format: 'smi',    Method: 'Embed' },
+                { Format: 'vtt',    Method: 'External' },
                 { Format: 'vtt',    Method: 'Embed' },
+                // Bitmap formats: Embed only (can't easily load external PGS/DVDSub)
                 { Format: 'pgssub', Method: 'Embed' },
                 { Format: 'dvdsub', Method: 'Embed' },
                 { Format: 'dvbsub', Method: 'Embed' },
@@ -515,6 +750,7 @@
             const plugins = [];
             if (window._mpvVideoPlayer) plugins.push('_mpvVideoPlayer');
             if (window._mpvAudioPlayer) plugins.push('_mpvAudioPlayer');
+            if (window._inputPlugin) plugins.push('_inputPlugin');
             console.warn('~TRACE~ NativeShell.getPlugins() returning ' + plugins.length + ' plugins: ' + plugins.join(', '));
             return plugins;
         },
@@ -559,8 +795,37 @@
                     console.warn('[JellyfinTauri] Failed to load video settings:', e);
                 }
 
+                // Load audio settings
+                try {
+                    const audioSettings = await api.settings.allValues('audio');
+                    if (audioSettings && typeof audioSettings === 'object') {
+                        for (const [k, v] of Object.entries(audioSettings)) {
+                            window.jmpInfo.settings.audio[k] = v;
+                        }
+                    }
+                } catch (e) {
+                    console.warn('[JellyfinTauri] Failed to load audio settings:', e);
+                }
+
+                // Load subtitle settings
+                try {
+                    const subtitleSettings = await api.settings.allValues('subtitles');
+                    if (subtitleSettings && typeof subtitleSettings === 'object') {
+                        for (const [k, v] of Object.entries(subtitleSettings)) {
+                            window.jmpInfo.settings.subtitles[k] = v;
+                        }
+                    }
+                } catch (e) {
+                    console.warn('[JellyfinTauri] Failed to load subtitle settings:', e);
+                }
+
                 // Apply defaults for missing settings
-                const defaults = { fullscreen: false, alwaysOnTop: false };
+                const defaults = {
+                    fullscreen: false,
+                    alwaysOnTop: false,
+                    forceAlwaysFS: false,
+                    allowBrowserZoom: false,
+                };
                 for (const [k, v] of Object.entries(defaults)) {
                     if (window.jmpInfo.settings.main[k] === undefined) {
                         window.jmpInfo.settings.main[k] = v;
@@ -570,6 +835,30 @@
                 // Apply fullscreen if saved
                 if (window.jmpInfo.settings.main.fullscreen) {
                     api.window.setFullscreen(true);
+                }
+
+                // Apply always-on-top if saved
+                if (window.jmpInfo.settings.main.alwaysOnTop) {
+                    api.window.setAlwaysOnTop(true);
+                }
+
+                // Zoom control — block Ctrl+Scroll and Ctrl+Plus/Minus unless allowed
+                const applyZoomLock = () => {
+                    if (!window.jmpInfo.settings.main.allowBrowserZoom) {
+                        document.addEventListener('wheel', (e) => {
+                            if (e.ctrlKey) e.preventDefault();
+                        }, { passive: false });
+                        document.addEventListener('keydown', (e) => {
+                            if (e.ctrlKey && (e.key === '+' || e.key === '-' || e.key === '=' || e.key === '0')) {
+                                e.preventDefault();
+                            }
+                        });
+                    }
+                };
+                if (document.body) {
+                    applyZoomLock();
+                } else {
+                    document.addEventListener('DOMContentLoaded', applyZoomLock);
                 }
 
                 // Settings proxy — saves to store and notifies listeners
@@ -604,6 +893,38 @@
                     videoSettingsHandler
                 );
 
+                // Audio settings proxy — same pattern
+                const audioSettingsHandler = {
+                    set(target, prop, value) {
+                        target[prop] = value;
+                        api.settings.setValue('audio', prop, value);
+                        window.jmpInfo.settingsUpdate.forEach(fn => {
+                            try { fn('audio'); } catch (e) { console.error(e); }
+                        });
+                        return true;
+                    }
+                };
+                window.jmpInfo.settings.audio = new Proxy(
+                    window.jmpInfo.settings.audio,
+                    audioSettingsHandler
+                );
+
+                // Subtitle settings proxy — same pattern
+                const subtitleSettingsHandler = {
+                    set(target, prop, value) {
+                        target[prop] = value;
+                        api.settings.setValue('subtitles', prop, value);
+                        window.jmpInfo.settingsUpdate.forEach(fn => {
+                            try { fn('subtitles'); } catch (e) { console.error(e); }
+                        });
+                        return true;
+                    }
+                };
+                window.jmpInfo.settings.subtitles = new Proxy(
+                    window.jmpInfo.settings.subtitles,
+                    subtitleSettingsHandler
+                );
+
                 // Listen for settings changes from Rust
                 api.settings.settingsValue.connect((data) => {
                     if (data && data.section === 'main' && data.key && data.value !== undefined) {
@@ -614,12 +935,12 @@
                 });
 
                 // Cursor auto-hide: observe body.mouseIdle class
+                // Calls native cursor hide so it works even outside the web content area
                 const cursorObserver = new MutationObserver((mutations) => {
                     for (const m of mutations) {
                         if (m.attributeName === 'class') {
                             const isIdle = document.body.classList.contains('mouseIdle');
-                            // Could emit to Rust for cursor visibility,
-                            // but WebView2 handles cursor visibility natively via CSS
+                            api.window.setCursorVisible(!isIdle);
                         }
                     }
                 });
@@ -691,6 +1012,7 @@
                 const plugins = [];
                 if (window._mpvVideoPlayer) plugins.push('_mpvVideoPlayer');
                 if (window._mpvAudioPlayer) plugins.push('_mpvAudioPlayer');
+                if (window._inputPlugin) plugins.push('_inputPlugin');
                 return plugins;
             },
         },

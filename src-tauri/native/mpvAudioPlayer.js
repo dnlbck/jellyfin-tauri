@@ -171,6 +171,13 @@
                 // For audio, we init normally — the video player might already have init'd
                 await mpv.ensureInit(false);
 
+                // Apply audio configuration settings (device, passthrough, channels, etc.)
+                try {
+                    await self._applyAudioSettings();
+                } catch (e) {
+                    console.warn('[MPV Audio] Failed to apply audio settings:', e);
+                }
+
                 // Set video to none for audio-only playback
                 await mpv.setProperty('vid', 'no');
 
@@ -228,6 +235,61 @@
                 mpv.off('file-loaded', self._mpvEventHandler);
                 mpv.off('end-file', self._mpvEventHandler);
                 self._duration = undefined;
+            };
+
+            /**
+             * Apply audio configuration settings (device, channels, passthrough, etc.)
+             * from jmpInfo.settings.audio to the MPV instance. Called once per play().
+             */
+            self._applyAudioSettings = async () => {
+                const audioSettings = window.jmpInfo?.settings?.audio;
+                if (!audioSettings) return;
+
+                const mgr = window.__mpvManager;
+
+                // Exclusive mode (WASAPI exclusive on Windows)
+                if (audioSettings.exclusive) {
+                    await mgr.setProperty('audio-exclusive', 'yes');
+                } else {
+                    await mgr.setProperty('audio-exclusive', 'no');
+                }
+
+                // Normalize downmix volume
+                if (audioSettings.normalize) {
+                    await mgr.setProperty('audio-normalize-downmix', 'yes');
+                    await mgr.setProperty('audio-swresample-o', 'surround_mix_level=1');
+                } else {
+                    await mgr.setProperty('audio-normalize-downmix', 'no');
+                }
+
+                // Passthrough — build comma-separated codec list for audio-spdif
+                const passthrough = [];
+                if (audioSettings.passthrough_ac3)    passthrough.push('ac3');
+                if (audioSettings.passthrough_dts)    passthrough.push('dts');
+                if (audioSettings.passthrough_eac3)   passthrough.push('eac3');
+                if (audioSettings.passthrough_dtshd)  passthrough.push('dts-hd');
+                if (audioSettings.passthrough_truehd) passthrough.push('truehd');
+                if (passthrough.length > 0) {
+                    await mgr.setProperty('audio-spdif', passthrough.join(','));
+                } else {
+                    await mgr.setProperty('audio-spdif', '');
+                }
+
+                // Audio channels
+                const channelMap = { 'auto': 'auto', '2.0': 'stereo', '5.1': '5.1', '7.1': '7.1' };
+                const channels = channelMap[audioSettings.channels] || 'auto';
+                if (passthrough.length > 0 && audioSettings.channels === 'auto') {
+                    await mgr.setProperty('audio-channels', 'stereo');
+                } else {
+                    await mgr.setProperty('audio-channels', channels);
+                }
+
+                // Audio device
+                if (audioSettings.device && audioSettings.device !== 'auto') {
+                    await mgr.setProperty('audio-device', audioSettings.device);
+                }
+
+                console.log('[MPV Audio] Audio settings applied');
             };
         }
 
