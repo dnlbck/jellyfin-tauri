@@ -1,6 +1,6 @@
 # Jellyfin Desktop (Tauri)
 
-A lightweight Jellyfin desktop client built with Tauri v2 + WebView2, designed to replace the Qt WebEngine-based Jellyfin Desktop. The primary motivation is **native subtitle handling** — the Jellyfin server is poor at subtitle track transcoding, so users end up downloading videos and watching in VLC. This client integrates libmpv for direct playback of all formats (SRT, ASS, PGS, etc.) without server transcoding.
+A lightweight Jellyfin desktop client built with Tauri v2 + WebView2, designed to replace the Qt WebEngine-based Jellyfin Desktop. Qt lacks Windows on ARM support and the WebView2-based approach gives better battery life on Snapdragon laptops. This client integrates libmpv for direct playback of all formats with native subtitle rendering (SRT, ASS, PGS, etc.).
 
 ## Target Platform
 
@@ -214,18 +214,12 @@ window.api = {
 window.apiPromise = Promise.resolve(window.api);  // Immediately available
 ```
 
-### Subtitle Handling (The Whole Point)
+### Subtitle Handling
 
-The Jellyfin server's subtitle behavior:
-1. **External subs** (SRT/ASS/VTT): Server provides a download URL. Client fetches and renders.
-2. **Embedded subs** (SRT/ASS in MKV): Server can extract on-the-fly. Client plays the extracted stream.
-3. **Bitmap subs** (PGS/DVDSub): Server must **burn-in** (re-encode entire video) for HTML5 clients. MPV handles these natively.
-
-With MPV:
-- External: `--sub-file=URL` — MPV fetches and renders
-- Embedded: `--sid=N` — MPV reads directly from container
-- Bitmap (PGS): `--sid=N` — MPV renders the bitmap overlay
-- No server transcoding ever needed
+MPV handles all subtitle formats natively:
+- **External subs** (SRT/ASS/VTT): `--sub-file=URL` — MPV fetches and renders directly
+- **Embedded subs** (SRT/ASS in MKV): `--sid=N` — MPV reads directly from the container
+- **Bitmap subs** (PGS/DVDSub): `--sid=N` — MPV renders the bitmap overlay natively
 
 ### Server Response Format
 
