@@ -28,11 +28,16 @@ A lightweight Jellyfin desktop client built with Tauri v2 + WebView2, designed t
 │         ▲ invoke()  ▼ listen()                   │
 ├──────────────────────────────────────────────────┤
 │  Tauri Rust Backend (lib.rs)                     │
-│  - Server connectivity (reqwest)                 │
+│  - Server connectivity (reqwest, cancellable)    │
 │  - Settings persistence (tauri-plugin-store)     │
 │  - Window management + geometry save/restore     │
-│  - Power management (SetThreadExecutionState)    │
+│  - Power management (Win: SetThreadExecState,    │
+│    Linux: D-Bus org.freedesktop.ScreenSaver)     │
 │  - OS media controls (souvlaki: SMTC / MPRIS)   │
+│  - Taskbar progress (Win: ITaskbarList3 COM)     │
+│  - Network interface enumeration                 │
+│  - Single-instance enforcement                   │
+│  - CLI argument parsing (clap)                   │
 │  - Structured logging (tauri-plugin-log)         │
 │  - GitHub release update checker                 │
 ├──────────────────────────────────────────────────┤
@@ -60,7 +65,7 @@ A lightweight Jellyfin desktop client built with Tauri v2 + WebView2, designed t
 
 - **Tauri v2 project scaffolded** and compiling on aarch64-pc-windows-msvc
 - **Server connect screen** — local HTML/CSS/TS page with dark Jellyfin theme
-- **Server connectivity check** — Rust `reqwest` hits Jellyfin `/System/Info/Public`, returns server name/version
+- **Server connectivity check** — Rust `reqwest` hits Jellyfin `/System/Info/Public`, returns server name/version; cancellable via `cancel_server_connectivity` with an `AtomicBool` flag
 - **Server URL persistence** — saved/loaded via `tauri-plugin-store` in `settings.json`
 - **Navigation** — after connect, webview navigates to jellyfin-web on the server
 - **libmpv integrated** via `tauri-plugin-libmpv` (v0.3.2) — plugin initialized, DLLs bundled in `src-tauri/lib/`
@@ -79,19 +84,25 @@ A lightweight Jellyfin desktop client built with Tauri v2 + WebView2, designed t
 - **Player plugins** (ported from original Qt app, injected as initialization scripts):
   - `mpvVideoPlayer.js` — video player plugin with subtitle handling (external URL + embedded track switching), WebView transparency management, playback state tracking
   - `mpvAudioPlayer.js` — audio player plugin with fade-out on stop, audio device settings (exclusive mode, passthrough codecs, channel config, normalization)
-  - `inputPlugin.js` — keyboard shortcut mapping (play/pause, volume, seek, fullscreen, subtitles, audio track) and OS media control event bridging (SMTC/MPRIS → jellyfin-web)
-- **Rust backend commands** (31 commands across 7 categories):
-  - **Server**: `check_server_connectivity`, `save_server_url`, `get_saved_server`, `navigate_to_server`
+  - `inputPlugin.js` — keyboard shortcut mapping (play/pause, volume, seek, fullscreen, subtitles, audio track), OS media control event bridging (SMTC/MPRIS → jellyfin-web), and taskbar progress bar updates
+- **Rust backend commands** (43 commands across 9 categories):
+  - **Server**: `check_server_connectivity`, `cancel_server_connectivity`, `save_server_url`, `get_saved_server`, `navigate_to_server`
   - **Settings**: `settings_get_value`, `settings_set_value`, `settings_set_values`, `settings_delete_section`, `settings_get_all`
   - **Window**: `window_set_fullscreen`, `window_is_fullscreen`, `window_set_always_on_top`, `window_is_always_on_top`, `window_raise`, `window_set_cursor_visible`, `window_save_geometry`
-  - **System**: `system_hello`, `system_open_external_url`, `system_exit`, `system_restart`, `system_debug_info`, `system_check_for_updates`
-  - **Power**: `power_set_screensaver_enabled` (Windows `SetThreadExecutionState` FFI)
-  - **Media controls**: `media_notify_playback_state`, `media_notify_metadata`, `media_notify_stop`, `media_notify_position`
+  - **System**: `system_hello`, `system_open_external_url`, `system_exit`, `system_restart`, `system_debug_info`, `system_check_for_updates`, `system_network_addresses`
+  - **Power**: `power_set_screensaver_enabled` (Windows `SetThreadExecutionState` FFI; Linux D-Bus `org.freedesktop.ScreenSaver` Inhibit/UnInhibit)
+  - **Media controls**: `media_notify_playback_state`, `media_notify_metadata`, `media_notify_stop`, `media_notify_position`, `media_notify_duration`, `media_notify_volume`, `media_notify_rate`, `media_notify_shuffle`, `media_notify_repeat`, `media_notify_queue`
+  - **Taskbar**: `taskbar_set_progress`, `taskbar_set_state` (Windows ITaskbarList3 COM; no-op on other platforms)
   - **Logging**: `log_from_webview`
-- **OS media controls** — souvlaki integration for SMTC (Windows) / MPRIS (Linux)
+- **OS media controls** — souvlaki integration for SMTC (Windows) / MPRIS (Linux), with bidirectional events: SeekBy, SetPosition, and SetVolume events from the OS are forwarded back to jellyfin-web
+- **Taskbar progress** — Windows taskbar progress bar via raw ITaskbarList3 COM vtable, updates during playback with play/pause/stop state
+- **Single-instance enforcement** — `tauri-plugin-single-instance` prevents multiple app instances; second launch focuses the existing window
+- **CLI arguments** — `--fullscreen`, `--windowed`, `--tv`, `--desktop`, `--log-level` via clap
+- **Network addresses** — enumerates local network interfaces via `local-ip-address` crate
 - **Window geometry** — save/restore position, size, and maximized state (debounced 900ms on move/resize)
 - **Structured logging** — `tauri-plugin-log` with stdout + file targets
 - **GitHub update checker** — checks GitHub releases, emits `system-update-info` event
+- **Linux screensaver inhibit** — D-Bus `org.freedesktop.ScreenSaver` Inhibit/UnInhibit via zbus
 
 ### 🔧 In Progress (MPV Playback)
 
@@ -147,11 +158,15 @@ jellyfin-tauri/
 | `tauri-plugin-opener` | 2 | Open external URLs |
 | `reqwest` | 0.12 | HTTP client (`native-tls` feature) |
 | `souvlaki` | 0.8 | OS media controls (SMTC on Windows, MPRIS on Linux) |
+| `tauri-plugin-single-instance` | 2 | Prevent multiple app instances |
+| `local-ip-address` | 0.6 | Network interface enumeration |
+| `clap` | 4 | CLI argument parsing |
 | `serde` / `serde_json` | 1 | JSON serialization |
 | `tokio` | 1 | Async runtime |
 | `raw-window-handle` | 0.6 | Window handle interop (for souvlaki) |
 | `open` | 5 | Open URLs in default browser |
 | `log` | 0.4 | Logging facade |
+| `zbus` | 5 | D-Bus client for Linux screensaver inhibit (Linux only) |
 
 ### npm (package.json)
 
@@ -182,6 +197,16 @@ npm run tauri build -- --no-bundle
 
 # Binary output:
 # src-tauri/target/release/jellyfin-tauri.exe
+```
+
+### CLI Flags
+
+```bash
+jellyfin-tauri.exe --fullscreen     # Start in fullscreen
+jellyfin-tauri.exe --windowed       # Force windowed (overrides saved state)
+jellyfin-tauri.exe --tv             # TV layout mode
+jellyfin-tauri.exe --desktop        # Desktop layout mode (default)
+jellyfin-tauri.exe --log-level debug  # Set log level (debug, info, warn, error)
 ```
 
 **Important build note:** Do NOT use `rustls-tls` feature for reqwest — it pulls in the `ring` crate which fails to compile on ARM64 without MSVC build tools (missing `assert.h`). Use `native-tls` instead (Windows SChannel, no C compilation needed).
@@ -253,4 +278,20 @@ Settings are stored via `tauri-plugin-store` (typically at `AppData/Roaming/jell
 
 ### OS Media Controls
 
-The app integrates with the OS media transport controls (SMTC on Windows, MPRIS on Linux) via souvlaki. The `inputPlugin.js` sends metadata, position, and playback state to Rust via `media_notify_*` commands, and receives control events (play/pause/stop/next/previous) back from the OS.
+The app integrates with the OS media transport controls (SMTC on Windows, MPRIS on Linux) via souvlaki. The `inputPlugin.js` sends metadata, position, and playback state to Rust via `media_notify_*` commands, and receives control events (play/pause/stop/next/previous/seek/volume) back from the OS.
+
+The Rust backend caches metadata fields so that individual field updates (e.g. duration arriving after initial metadata) can re-apply the full metadata to souvlaki without losing other fields.
+
+**Note:** souvlaki v0.8 does not expose `set_volume`, shuffle, repeat, or playback rate — these are logged but not forwarded. The commands are wired up in anticipation of future souvlaki releases.
+
+### Taskbar Progress (Windows)
+
+During playback, the Windows taskbar icon shows a progress bar via the `ITaskbarList3` COM interface (raw vtable, no `windows` crate dependency). The bar reflects playback position and changes state on play (green), pause (yellow), and stop (cleared).
+
+### Single-Instance Enforcement
+
+`tauri-plugin-single-instance` ensures only one app instance runs. If a second instance is launched, the existing window is focused and brought to the foreground.
+
+### Linux Screensaver Inhibit
+
+On Linux, the `org.freedesktop.ScreenSaver` D-Bus interface is used to inhibit the screensaver during video playback via zbus. The inhibit cookie is tracked for proper `UnInhibit` on stop.
