@@ -155,17 +155,42 @@
                     positionMs: Math.round(ms),
                 }).catch(() => {});
             },
-            notifyDurationChange: (ms) => {},
+            notifyDurationChange: (ms) => {
+                invoke('media_notify_duration', {
+                    durationMs: Math.round(ms),
+                }).catch(() => {});
+            },
             notifyPlaybackState: (state) => {
                 return invoke('media_notify_playback_state', {
                     playing: state === 'Playing',
                 }).catch(() => {});
             },
-            notifyVolumeChange:   (vol)             => {},
-            notifyRateChange:     (rate)            => {},
-            notifyShuffleChange:  (enabled)         => {},
-            notifyRepeatChange:   (mode)            => {},
-            notifyQueueChange:    (canNext, canPrev) => {},
+            notifyVolumeChange: (vol) => {
+                invoke('media_notify_volume', {
+                    volume: typeof vol === 'number' ? vol : 0,
+                }).catch(() => {});
+            },
+            notifyRateChange: (rate) => {
+                invoke('media_notify_rate', {
+                    rate: typeof rate === 'number' ? rate : 1.0,
+                }).catch(() => {});
+            },
+            notifyShuffleChange: (enabled) => {
+                invoke('media_notify_shuffle', {
+                    enabled: !!enabled,
+                }).catch(() => {});
+            },
+            notifyRepeatChange: (mode) => {
+                invoke('media_notify_repeat', {
+                    mode: String(mode || 'RepeatNone'),
+                }).catch(() => {});
+            },
+            notifyQueueChange: (canNext, canPrev) => {
+                invoke('media_notify_queue', {
+                    canNext: !!canNext,
+                    canPrev: !!canPrev,
+                }).catch(() => {});
+            },
             notifyPlaybackStop: (isNavigating) => {
                 return invoke('media_notify_stop').catch(() => {});
             },
@@ -249,7 +274,7 @@
             debugInformation:        ()     => invoke('system_debug_info'),
             checkForUpdates:         ()     => invoke('system_check_for_updates'),
             checkServerConnectivity: (url)  => invoke('check_server_connectivity', { url }),
-            cancelServerConnectivity:()     => Promise.resolve(),
+            cancelServerConnectivity:()     => invoke('cancel_server_connectivity'),
             getUserAgent:            ()     => Promise.resolve(navigator.userAgent),
             getCapabilitiesString:   ()     => Promise.resolve(JSON.stringify({
                 PlayableMediaTypes: ['Audio', 'Video'],
@@ -263,7 +288,7 @@
                 SupportsMediaControl: true,
                 SupportsPersistentIdentifier: true,
             })),
-            networkAddresses:        ()     => Promise.resolve([]),
+            networkAddresses:        ()     => invoke('system_network_addresses'),
             fetchPageForCSPWorkaround:(url) => Promise.resolve(''),
             updateInfoEmitted:       createSignal('system-update-info'),
             serverConnectivityResult:createSignal('system-server-connectivity-result'),

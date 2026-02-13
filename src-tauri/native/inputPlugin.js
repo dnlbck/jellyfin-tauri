@@ -102,6 +102,9 @@
     // Tags where keyboard shortcuts should NOT fire
     const INPUT_TAGS = new Set(['INPUT', 'TEXTAREA', 'SELECT']);
 
+    // Tauri IPC helper
+    const invoke = window.__TAURI__.core.invoke;
+
     // ====================================================================
     // InputPlugin class
     // ====================================================================
@@ -219,10 +222,7 @@
                     break;
                 case 'host:toggleDebug':
                     // Toggle mpv stats overlay if available
-                    try {
-                        const { invoke } = window.__TAURI__.core;
-                        invoke('plugin:libmpv|command_string', { command: 'script-binding stats/display-stats-toggle' }).catch(() => {});
-                    } catch (_) {}
+                    invoke('plugin:libmpv|command_string', { command: 'script-binding stats/display-stats-toggle' }).catch(() => {});
                     break;
                 default:
                     console.warn('[InputPlugin] Unknown host action:', action);
@@ -238,6 +238,53 @@
                 const action = event.payload;
                 console.log('[InputPlugin] OS media control event:', action);
                 this._dispatchAction(action);
+            });
+
+            // SeekBy: OS requests relative seek (payload = signed ms, + forward, - backward)
+            this._unlistenMediaSeekBy = listen('media-seek-by', (event) => {
+                const offsetMs = event.payload;
+                console.log('[InputPlugin] OS media seek-by:', offsetMs, 'ms');
+                const pm = this._playbackManager;
+                try {
+                    const currentMs = pm.currentTime ? pm.currentTime() : 0;
+                    const targetMs = Math.max(0, currentMs + offsetMs);
+                    const player = pm.getCurrentPlayer();
+                    if (player) {
+                        pm.seek(targetMs * 10000, player); // ticks
+                    }
+                } catch (e) {
+                    console.warn('[InputPlugin] SeekBy failed:', e);
+                }
+            });
+
+            // SetPosition: OS requests absolute seek (payload = ms)
+            this._unlistenMediaSetPosition = listen('media-set-position', (event) => {
+                const posMs = event.payload;
+                console.log('[InputPlugin] OS media set-position:', posMs, 'ms');
+                const pm = this._playbackManager;
+                try {
+                    const player = pm.getCurrentPlayer();
+                    if (player) {
+                        pm.seek(posMs * 10000, player); // ticks
+                    }
+                } catch (e) {
+                    console.warn('[InputPlugin] SetPosition failed:', e);
+                }
+            });
+
+            // SetVolume: OS requests volume change (payload = 0.0-1.0)
+            this._unlistenMediaSetVolume = listen('media-set-volume', (event) => {
+                const vol = event.payload;
+                console.log('[InputPlugin] OS media set-volume:', vol);
+                const pm = this._playbackManager;
+                try {
+                    const player = pm.getCurrentPlayer();
+                    if (player) {
+                        pm.setVolume(Math.round(vol * 100), player);
+                    }
+                } catch (e) {
+                    console.warn('[InputPlugin] SetVolume failed:', e);
+                }
             });
         }
 
@@ -300,6 +347,9 @@
 
                 // Inhibit screensaver during playback
                 api.power.setScreensaverEnabled(false);
+
+                // Set taskbar progress to normal (green)
+                invoke('taskbar_set_state', { state: 'normal' }).catch(() => {});
 
                 // Helper: safely resolve the current item
                 const resolveItem = () => {
@@ -367,11 +417,13 @@
             // --- playing / unpause ---
             on('unpause', () => {
                 api.player.notifyPlaybackState('Playing');
+                invoke('taskbar_set_state', { state: 'normal' }).catch(() => {});
             });
 
             // --- pause ---
             on('pause', () => {
                 api.player.notifyPlaybackState('Paused');
+                invoke('taskbar_set_state', { state: 'paused' }).catch(() => {});
             });
 
             // --- playbackstop ---
@@ -382,6 +434,9 @@
 
                 // Re-enable screensaver when playback stops
                 api.power.setScreensaverEnabled(true);
+
+                // Clear taskbar progress
+                invoke('taskbar_set_state', { state: 'none' }).catch(() => {});
 
                 // Restore default window title
                 api.window.setTitle('Jellyfin Desktop').catch(() => {});
@@ -433,6 +488,15 @@
 
                         window.api.player.notifyPosition(currentMs);
                         this._lastPositionMs = currentMs;
+
+                        // Update taskbar progress bar
+                        const durationMs = pm.duration ? pm.duration() : 0;
+                        if (durationMs > 0) {
+                            invoke('taskbar_set_progress', {
+                                positionMs: Math.round(currentMs),
+                                durationMs: Math.round(durationMs),
+                            }).catch(() => {});
+                        }
                     }
                 } catch (_) {}
             }, 500);
@@ -478,6 +542,18 @@
             if (this._unlistenMediaControl) {
                 this._unlistenMediaControl.then(fn => fn());
                 this._unlistenMediaControl = null;
+            }
+            if (this._unlistenMediaSeekBy) {
+                this._unlistenMediaSeekBy.then(fn => fn());
+                this._unlistenMediaSeekBy = null;
+            }
+            if (this._unlistenMediaSetPosition) {
+                this._unlistenMediaSetPosition.then(fn => fn());
+                this._unlistenMediaSetPosition = null;
+            }
+            if (this._unlistenMediaSetVolume) {
+                this._unlistenMediaSetVolume.then(fn => fn());
+                this._unlistenMediaSetVolume = null;
             }
 
             // Unsubscribe from playback events

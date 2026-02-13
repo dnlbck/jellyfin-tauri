@@ -2,7 +2,7 @@ use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_log::{Target, TargetKind};
 use tauri_plugin_store::StoreExt;
@@ -27,13 +27,22 @@ pub struct ServerInfo {
     id: String,
 }
 
+// Shared cancellation flag for server connectivity checks
+struct ConnectivityCancelFlag(Arc<AtomicBool>);
+
 // ========================================================================
 // Server Commands
 // ========================================================================
 
 #[tauri::command]
-async fn check_server_connectivity(url: String) -> Result<ServerInfo, String> {
+async fn check_server_connectivity(
+    url: String,
+    cancel_flag: State<'_, ConnectivityCancelFlag>,
+) -> Result<ServerInfo, String> {
     info!("Checking server connectivity: {}", url);
+    // Reset flag at start of new check
+    cancel_flag.0.store(false, Ordering::Relaxed);
+
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .timeout(std::time::Duration::from_secs(10))
@@ -42,6 +51,10 @@ async fn check_server_connectivity(url: String) -> Result<ServerInfo, String> {
             error!("Failed to build HTTP client: {}", e);
             e.to_string()
         })?;
+
+    if cancel_flag.0.load(Ordering::Relaxed) {
+        return Err("Cancelled".to_string());
+    }
 
     let info_url = format!("{}/System/Info/Public", url.trim_end_matches('/'));
     debug!("Fetching server info from: {}", info_url);
@@ -53,6 +66,10 @@ async fn check_server_connectivity(url: String) -> Result<ServerInfo, String> {
             error!("Connection to {} failed: {}", info_url, e);
             format!("Connection failed: {}", e)
         })?;
+
+    if cancel_flag.0.load(Ordering::Relaxed) {
+        return Err("Cancelled".to_string());
+    }
 
     let status = resp.status();
     debug!("Server response status: {}", status);
@@ -69,6 +86,12 @@ async fn check_server_connectivity(url: String) -> Result<ServerInfo, String> {
         })?;
     info!("Connected to server: {} v{} (id={})", server_info.name, server_info.version, server_info.id);
     Ok(server_info)
+}
+
+#[tauri::command]
+fn cancel_server_connectivity(cancel_flag: State<'_, ConnectivityCancelFlag>) {
+    debug!("Server connectivity check cancelled");
+    cancel_flag.0.store(true, Ordering::Relaxed);
 }
 
 #[tauri::command]
@@ -377,7 +400,7 @@ async fn system_check_for_updates(app: AppHandle) -> Result<(), String> {
         .build()
         .map_err(|e| e.to_string())?;
 
-    let url = "https://github.com/jellyfin/jellyfin-desktop/releases/latest";
+    let url = "https://github.com/dnlbck/jellyfin-tauri/releases/latest";
     match client.get(url).send().await {
         Ok(resp) => {
             let final_url = resp.url().to_string();
@@ -390,6 +413,21 @@ async fn system_check_for_updates(app: AppHandle) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[tauri::command]
+fn system_network_addresses() -> Vec<String> {
+    let mut addresses = Vec::new();
+    if let Ok(list) = local_ip_address::list_afinet_netifas() {
+        for (_, ip) in list {
+            let s = ip.to_string();
+            if !addresses.contains(&s) {
+                addresses.push(s);
+            }
+        }
+    }
+    debug!("Network addresses: {:?}", addresses);
+    addresses
 }
 
 // ========================================================================
@@ -416,13 +454,235 @@ mod power {
     }
 }
 
+#[cfg(target_os = "linux")]
+mod power {
+    use std::sync::Mutex;
+
+    static INHIBIT_COOKIE: Mutex<Option<u32>> = Mutex::new(None);
+
+    pub fn set_screensaver_enabled(enabled: bool) {
+        // Use org.freedesktop.ScreenSaver D-Bus interface
+        tokio::task::block_in_place(|| {
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(async {
+                match zbus::Connection::session().await {
+                    Ok(conn) => {
+                        if enabled {
+                            // Un-inhibit: release the cookie
+                            let cookie = INHIBIT_COOKIE.lock().unwrap().take();
+                            if let Some(c) = cookie {
+                                let _ = conn
+                                    .call_method(
+                                        Some("org.freedesktop.ScreenSaver"),
+                                        "/org/freedesktop/ScreenSaver",
+                                        Some("org.freedesktop.ScreenSaver"),
+                                        "UnInhibit",
+                                        &(c,),
+                                    )
+                                    .await;
+                                log::debug!("Screensaver un-inhibited (cookie={})", c);
+                            }
+                        } else {
+                            // Inhibit
+                            match conn
+                                .call_method(
+                                    Some("org.freedesktop.ScreenSaver"),
+                                    "/org/freedesktop/ScreenSaver",
+                                    Some("org.freedesktop.ScreenSaver"),
+                                    "Inhibit",
+                                    &("Jellyfin Desktop", "Media playback"),
+                                )
+                                .await
+                            {
+                                Ok(reply) => {
+                                    if let Ok(cookie) = reply.body().deserialize::<u32>() {
+                                        *INHIBIT_COOKIE.lock().unwrap() = Some(cookie);
+                                        log::debug!("Screensaver inhibited (cookie={})", cookie);
+                                    }
+                                }
+                                Err(e) => {
+                                    log::warn!("Failed to inhibit screensaver via D-Bus: {}", e);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to connect to session D-Bus: {}", e);
+                    }
+                }
+            });
+        });
+    }
+}
+
 #[tauri::command]
 async fn power_set_screensaver_enabled(enabled: bool) -> Result<(), String> {
     debug!("Setting screensaver enabled: {}", enabled);
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     power::set_screensaver_enabled(enabled);
     Ok(())
 }
+
+// ========================================================================
+// Windows Taskbar Integration (Progress Bar)
+// ========================================================================
+
+#[cfg(target_os = "windows")]
+mod taskbar {
+    use std::sync::Mutex;
+
+    // ITaskbarList3 COM interface for progress bar
+    #[repr(C)]
+    struct ITaskbarList3Vtbl {
+        // IUnknown
+        query_interface: usize,
+        add_ref: unsafe extern "system" fn(*mut ITaskbarList3) -> u32,
+        release: unsafe extern "system" fn(*mut ITaskbarList3) -> u32,
+        // ITaskbarList
+        hr_init: unsafe extern "system" fn(*mut ITaskbarList3) -> i32,
+        add_tab: usize,
+        delete_tab: usize,
+        activate_tab: usize,
+        set_active_alt: usize,
+        // ITaskbarList2
+        mark_fullscreen_window: usize,
+        // ITaskbarList3
+        set_progress_value:
+            unsafe extern "system" fn(*mut ITaskbarList3, isize, u64, u64) -> i32,
+        set_progress_state:
+            unsafe extern "system" fn(*mut ITaskbarList3, isize, u32) -> i32,
+        // ... more methods we don't need
+    }
+
+    #[repr(C)]
+    struct ITaskbarList3 {
+        vtbl: *const ITaskbarList3Vtbl,
+    }
+
+    // Progress state flags
+    const TBPF_NOPROGRESS: u32 = 0x00;
+    const TBPF_NORMAL: u32 = 0x02;
+    const TBPF_PAUSED: u32 = 0x08;
+
+    extern "system" {
+        fn CoCreateInstance(
+            rclsid: *const [u8; 16],
+            punk_outer: *mut std::ffi::c_void,
+            cls_context: u32,
+            riid: *const [u8; 16],
+            ppv: *mut *mut std::ffi::c_void,
+        ) -> i32;
+        fn CoInitializeEx(reserved: *mut std::ffi::c_void, co_init: u32) -> i32;
+    }
+
+    // CLSID_TaskbarList = {56FDF344-FD6D-11d0-958A-006097C9A090}
+    const CLSID_TASKBAR_LIST: [u8; 16] = [
+        0x44, 0xF3, 0xFD, 0x56, 0x6D, 0xFD, 0xD0, 0x11,
+        0x95, 0x8A, 0x00, 0x60, 0x97, 0xC9, 0xA0, 0x90,
+    ];
+    // IID_ITaskbarList3 = {ea1afb91-9e28-4b86-90e9-9e9f8a5eefaf}
+    const IID_ITASKBAR_LIST3: [u8; 16] = [
+        0x91, 0xFB, 0x1A, 0xEA, 0x28, 0x9E, 0x86, 0x4B,
+        0x90, 0xE9, 0x9E, 0x9F, 0x8A, 0x5E, 0xEF, 0xAF,
+    ];
+
+    pub struct TaskbarProgress {
+        taskbar: *mut ITaskbarList3,
+        hwnd: isize,
+    }
+
+    // Safety: COM pointers are thread-safe for ITaskbarList3 when CoInitialized per-thread
+    unsafe impl Send for TaskbarProgress {}
+    unsafe impl Sync for TaskbarProgress {}
+
+    impl TaskbarProgress {
+        pub fn new(hwnd: isize) -> Option<Self> {
+            unsafe {
+                CoInitializeEx(std::ptr::null_mut(), 0x2); // COINIT_APARTMENTTHREADED
+                let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+                let hr = CoCreateInstance(
+                    &CLSID_TASKBAR_LIST,
+                    std::ptr::null_mut(),
+                    0x1 | 0x4, // CLSCTX_INPROC_SERVER | CLSCTX_LOCAL_SERVER
+                    &IID_ITASKBAR_LIST3,
+                    &mut ptr,
+                );
+                if hr < 0 || ptr.is_null() {
+                    log::warn!("Failed to create ITaskbarList3: HRESULT 0x{:08x}", hr);
+                    return None;
+                }
+                let taskbar = ptr as *mut ITaskbarList3;
+                let init_hr = ((*(*taskbar).vtbl).hr_init)(taskbar);
+                if init_hr < 0 {
+                    log::warn!("ITaskbarList3::HrInit failed: 0x{:08x}", init_hr);
+                    ((*(*taskbar).vtbl).release)(taskbar);
+                    return None;
+                }
+                Some(Self { taskbar, hwnd })
+            }
+        }
+
+        pub fn set_progress(&self, current: u64, total: u64) {
+            unsafe {
+                ((*(*self.taskbar).vtbl).set_progress_value)(
+                    self.taskbar,
+                    self.hwnd,
+                    current,
+                    total,
+                );
+            }
+        }
+
+        pub fn set_state(&self, state: &str) {
+            let flag = match state {
+                "normal" => TBPF_NORMAL,
+                "paused" => TBPF_PAUSED,
+                _ => TBPF_NOPROGRESS,
+            };
+            unsafe {
+                ((*(*self.taskbar).vtbl).set_progress_state)(self.taskbar, self.hwnd, flag);
+            }
+        }
+    }
+
+    impl Drop for TaskbarProgress {
+        fn drop(&mut self) {
+            unsafe {
+                ((*(*self.taskbar).vtbl).release)(self.taskbar);
+            }
+        }
+    }
+
+    pub static TASKBAR: Mutex<Option<TaskbarProgress>> = Mutex::new(None);
+}
+
+#[cfg(target_os = "windows")]
+#[tauri::command]
+fn taskbar_set_progress(position_ms: u64, duration_ms: u64) {
+    if let Ok(guard) = taskbar::TASKBAR.lock() {
+        if let Some(ref tb) = *guard {
+            tb.set_progress(position_ms, duration_ms);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[tauri::command]
+fn taskbar_set_state(state: String) {
+    if let Ok(guard) = taskbar::TASKBAR.lock() {
+        if let Some(ref tb) = *guard {
+            tb.set_state(&state);
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+fn taskbar_set_progress(_position_ms: u64, _duration_ms: u64) {}
+
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+fn taskbar_set_state(_state: String) {}
 
 // ========================================================================
 // OS Media Controls (SMTC / MPRIS)
@@ -431,6 +691,12 @@ async fn power_set_screensaver_enabled(enabled: bool) -> Result<(), String> {
 struct MediaControlsState {
     controls: Mutex<Option<souvlaki::MediaControls>>,
     is_playing: AtomicBool,
+    // Cached metadata so we can amend individual fields (e.g. duration only)
+    cached_title: Mutex<String>,
+    cached_artist: Mutex<Option<String>>,
+    cached_album: Mutex<Option<String>>,
+    cached_cover_url: Mutex<Option<String>>,
+    cached_duration_ms: Mutex<Option<u64>>,
 }
 
 #[tauri::command]
@@ -464,6 +730,13 @@ fn media_notify_metadata(
         "media_notify_metadata: title={}, artist={:?}, album={:?}",
         title, artist, album
     );
+    // Cache metadata so we can amend individual fields later
+    *state.cached_title.lock().unwrap() = title.clone();
+    *state.cached_artist.lock().unwrap() = artist.clone();
+    *state.cached_album.lock().unwrap() = album.clone();
+    *state.cached_cover_url.lock().unwrap() = cover_url.clone();
+    *state.cached_duration_ms.lock().unwrap() = duration_ms;
+
     if let Ok(mut guard) = state.controls.lock() {
         if let Some(controls) = guard.as_mut() {
             controls
@@ -477,6 +750,81 @@ fn media_notify_metadata(
                 .ok();
         }
     }
+}
+
+#[tauri::command]
+fn media_notify_duration(
+    state: State<'_, MediaControlsState>,
+    duration_ms: u64,
+) {
+    debug!("media_notify_duration: {}ms", duration_ms);
+    *state.cached_duration_ms.lock().unwrap() = Some(duration_ms);
+
+    // Re-apply metadata with updated duration
+    let title = state.cached_title.lock().unwrap().clone();
+    let artist = state.cached_artist.lock().unwrap().clone();
+    let album = state.cached_album.lock().unwrap().clone();
+    let cover_url = state.cached_cover_url.lock().unwrap().clone();
+
+    if let Ok(mut guard) = state.controls.lock() {
+        if let Some(controls) = guard.as_mut() {
+            controls
+                .set_metadata(souvlaki::MediaMetadata {
+                    title: Some(&title),
+                    artist: artist.as_deref(),
+                    album: album.as_deref(),
+                    cover_url: cover_url.as_deref(),
+                    duration: Some(std::time::Duration::from_millis(duration_ms)),
+                })
+                .ok();
+        }
+    }
+}
+
+#[tauri::command]
+fn media_notify_volume(
+    _state: State<'_, MediaControlsState>,
+    volume: f64,
+) {
+    // souvlaki 0.8 does not expose set_volume — log for future use
+    debug!("media_notify_volume: {} (not forwarded, souvlaki lacks set_volume)", volume);
+}
+
+#[tauri::command]
+fn media_notify_rate(
+    _state: State<'_, MediaControlsState>,
+    rate: f64,
+) {
+    // TODO: souvlaki v0.8 doesn't support playback rate — log for now
+    debug!("media_notify_rate: {} (not forwarded — souvlaki limitation)", rate);
+}
+
+#[tauri::command]
+fn media_notify_shuffle(
+    _state: State<'_, MediaControlsState>,
+    enabled: bool,
+) {
+    // TODO: souvlaki v0.8 doesn't support shuffle property
+    debug!("media_notify_shuffle: {} (not forwarded — souvlaki limitation)", enabled);
+}
+
+#[tauri::command]
+fn media_notify_repeat(
+    _state: State<'_, MediaControlsState>,
+    mode: String,
+) {
+    // TODO: souvlaki v0.8 doesn't support repeat/loop property
+    debug!("media_notify_repeat: {} (not forwarded — souvlaki limitation)", mode);
+}
+
+#[tauri::command]
+fn media_notify_queue(
+    _state: State<'_, MediaControlsState>,
+    can_next: bool,
+    can_prev: bool,
+) {
+    // TODO: souvlaki v0.8 doesn't support CanGoNext/CanGoPrevious toggles
+    debug!("media_notify_queue: canNext={}, canPrev={} (not forwarded — souvlaki limitation)", can_next, can_prev);
 }
 
 #[tauri::command]
@@ -531,12 +879,77 @@ async fn log_from_webview(level: String, message: String, context: Option<String
 
 
 // ========================================================================
+// CLI Arguments
+// ========================================================================
+
+#[derive(Debug, Clone)]
+struct CliArgs {
+    fullscreen: bool,
+    tv_mode: bool,
+    log_level: Option<String>,
+}
+
+fn parse_cli_args() -> CliArgs {
+    use clap::{Arg, Command};
+
+    let matches = Command::new("jellyfin-desktop")
+        .version(env!("CARGO_PKG_VERSION"))
+        .about("Jellyfin Desktop Client (Tauri)")
+        .arg(Arg::new("fullscreen").long("fullscreen").action(clap::ArgAction::SetTrue).help("Start in fullscreen mode"))
+        .arg(Arg::new("windowed").long("windowed").action(clap::ArgAction::SetTrue).help("Start in windowed mode"))
+        .arg(Arg::new("tv").long("tv").action(clap::ArgAction::SetTrue).help("Start in TV layout mode"))
+        .arg(Arg::new("desktop").long("desktop").action(clap::ArgAction::SetTrue).help("Start in desktop layout mode (default)"))
+        .arg(Arg::new("log-level").long("log-level").value_name("LEVEL").help("Log level: debug, info, warn, error"))
+        .get_matches();
+
+    let fullscreen = if matches.get_flag("windowed") {
+        false
+    } else {
+        matches.get_flag("fullscreen")
+    };
+
+    let tv_mode = if matches.get_flag("desktop") {
+        false
+    } else {
+        matches.get_flag("tv")
+    };
+
+    let log_level = matches.get_one::<String>("log-level").cloned();
+
+    CliArgs {
+        fullscreen,
+        tv_mode,
+        log_level,
+    }
+}
+
+// ========================================================================
 // Entry Point
 // ========================================================================
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let cli_args = parse_cli_args();
+
+    let log_level = match cli_args.log_level.as_deref() {
+        Some("error") => log::LevelFilter::Error,
+        Some("warn")  => log::LevelFilter::Warn,
+        Some("info")  => log::LevelFilter::Info,
+        Some("debug") => log::LevelFilter::Debug,
+        Some("trace") => log::LevelFilter::Trace,
+        _ => log::LevelFilter::Debug,
+    };
+
+    let cli_args_clone = cli_args.clone();
+
     tauri::Builder::default()
+        // Single-instance: focus existing window when second instance is launched
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.unminimize();
+                let _ = w.set_focus();
+            }
+        }))
         .plugin(
             tauri_plugin_log::Builder::new()
                 .targets([
@@ -548,15 +961,26 @@ pub fn run() {
                 ])
                 .max_file_size(5_000_000) // 5 MB per log file
                 .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepAll)
-                .level(log::LevelFilter::Debug)
+                .level(log_level)
                 .build(),
         )
         .plugin(tauri_plugin_libmpv::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
-        .setup(|app| {
+        .setup(move |app| {
             info!("Jellyfin Desktop starting up");
+            let cli = &cli_args_clone;
+
+            if cli.fullscreen {
+                info!("CLI: --fullscreen requested");
+            }
+            if cli.tv_mode {
+                info!("CLI: --tv mode requested");
+            }
+
+            // Manage cancellation flag for server connectivity checks
+            app.manage(ConnectivityCancelFlag(Arc::new(AtomicBool::new(false))));
 
             // Log the app data directory for easy log file discovery
             if let Ok(log_dir) = app.path().app_log_dir() {
@@ -566,17 +990,44 @@ pub fn run() {
                 info!("Data directory: {}", data_dir.display());
             }
 
-            // Create main window from config, adding our initialization script
+            // If CLI requests TV mode, inject a script to override jmpInfo.mode
+            let mode_script = if cli.tv_mode {
+                "\n(function(){ if(window.jmpInfo) window.jmpInfo.mode = 'tv'; })();\n"
+            } else {
+                ""
+            };
+
+            // Create main window from config, adding our initialization scripts
             // The window has "create": false in tauri.conf.json so Tauri doesn't auto-create it
             info!("Creating main webview window with injection scripts");
             let config = app.config().app.windows[0].clone();
-            let win = tauri::WebviewWindowBuilder::from_config(app.handle(), &config)?
+            let mut builder = tauri::WebviewWindowBuilder::from_config(app.handle(), &config)?
                 .initialization_script(INJECTION_SCRIPT)
                 .initialization_script(MPV_VIDEO_PLAYER)
                 .initialization_script(MPV_AUDIO_PLAYER)
-                .initialization_script(INPUT_PLUGIN)
-                .build()?;
+                .initialization_script(INPUT_PLUGIN);
+
+            if !mode_script.is_empty() {
+                builder = builder.initialization_script(mode_script);
+            }
+
+            let win = builder.build()?;
             info!("Main window created successfully");
+
+            // ── Initialize Windows Taskbar progress ──
+            #[cfg(target_os = "windows")]
+            {
+                use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                if let Ok(handle) = win.window_handle() {
+                    if let RawWindowHandle::Win32(h) = handle.as_raw() {
+                        let hwnd = h.hwnd.get() as isize;
+                        if let Some(tb) = taskbar::TaskbarProgress::new(hwnd) {
+                            *taskbar::TASKBAR.lock().unwrap() = Some(tb);
+                            info!("Windows taskbar progress initialized");
+                        }
+                    }
+                }
+            }
 
             // ── Initialize OS media controls (SMTC on Windows, MPRIS on Linux) ──
             {
@@ -611,7 +1062,7 @@ pub fn run() {
                         let app_handle = app.handle().clone();
                         if let Err(e) = controls.attach(move |event: souvlaki::MediaControlEvent| {
                             use souvlaki::{MediaControlEvent, SeekDirection};
-                            let action = match event {
+                            let action = match &event {
                                 MediaControlEvent::Play => "play",
                                 MediaControlEvent::Pause => "pause",
                                 MediaControlEvent::Toggle => "play_pause",
@@ -620,6 +1071,24 @@ pub fn run() {
                                 MediaControlEvent::Stop => "stop",
                                 MediaControlEvent::Seek(SeekDirection::Forward) => "seek_forward",
                                 MediaControlEvent::Seek(SeekDirection::Backward) => "seek_backward",
+                                MediaControlEvent::SeekBy(direction, duration) => {
+                                    let ms = duration.as_millis() as i64;
+                                    let signed_ms = match direction {
+                                        SeekDirection::Forward => ms,
+                                        SeekDirection::Backward => -ms,
+                                    };
+                                    let _ = app_handle.emit("media-seek-by", signed_ms);
+                                    return;
+                                }
+                                MediaControlEvent::SetPosition(pos) => {
+                                    let ms = pos.0.as_millis() as u64;
+                                    let _ = app_handle.emit("media-set-position", ms);
+                                    return;
+                                }
+                                MediaControlEvent::SetVolume(vol) => {
+                                    let _ = app_handle.emit("media-set-volume", *vol);
+                                    return;
+                                }
                                 MediaControlEvent::Raise => {
                                     if let Some(w) = app_handle.get_webview_window("main") {
                                         let _ = w.unminimize();
@@ -640,6 +1109,11 @@ pub fn run() {
                         app.manage(MediaControlsState {
                             controls: Mutex::new(Some(controls)),
                             is_playing: AtomicBool::new(false),
+                            cached_title: Mutex::new(String::new()),
+                            cached_artist: Mutex::new(None),
+                            cached_album: Mutex::new(None),
+                            cached_cover_url: Mutex::new(None),
+                            cached_duration_ms: Mutex::new(None),
                         });
                         info!("OS media controls initialized (SMTC/MPRIS)");
                     }
@@ -648,37 +1122,49 @@ pub fn run() {
                         app.manage(MediaControlsState {
                             controls: Mutex::new(None),
                             is_playing: AtomicBool::new(false),
+                            cached_title: Mutex::new(String::new()),
+                            cached_artist: Mutex::new(None),
+                            cached_album: Mutex::new(None),
+                            cached_cover_url: Mutex::new(None),
+                            cached_duration_ms: Mutex::new(None),
                         });
                     }
                 }
             }
 
-            // ── Restore saved window geometry ──
-            let store = app.store("settings.json").ok();
-            if let Some(ref store) = store {
-                let x = store.get("state.geometry.x").and_then(|v| v.as_i64()).map(|v| v as i32);
-                let y = store.get("state.geometry.y").and_then(|v| v.as_i64()).map(|v| v as i32);
-                let w = store.get("state.geometry.w").and_then(|v| v.as_u64()).map(|v| v as u32);
-                let h = store.get("state.geometry.h").and_then(|v| v.as_u64()).map(|v| v as u32);
-                let maximized = store.get("state.geometry.maximized").and_then(|v| v.as_bool()).unwrap_or(false);
+            // ── Apply CLI fullscreen override ──
+            if cli.fullscreen {
+                let _ = win.set_fullscreen(true);
+            }
 
-                if let (Some(x), Some(y), Some(w), Some(h)) = (x, y, w, h) {
-                    // Sanity check: only restore if size is reasonable
-                    if w >= 200 && h >= 150 {
-                        info!("Restoring window geometry: {}x{} at ({}, {}), maximized={}", w, h, x, y, maximized);
-                        let _ = win.set_position(tauri::PhysicalPosition::new(x, y));
-                        let _ = win.set_size(tauri::PhysicalSize::new(w, h));
+            // ── Restore saved window geometry (only if not overridden by CLI) ──
+            if !cli.fullscreen {
+                let store = app.store("settings.json").ok();
+                if let Some(ref store) = store {
+                    let x = store.get("state.geometry.x").and_then(|v| v.as_i64()).map(|v| v as i32);
+                    let y = store.get("state.geometry.y").and_then(|v| v.as_i64()).map(|v| v as i32);
+                    let w = store.get("state.geometry.w").and_then(|v| v.as_u64()).map(|v| v as u32);
+                    let h = store.get("state.geometry.h").and_then(|v| v.as_u64()).map(|v| v as u32);
+                    let maximized = store.get("state.geometry.maximized").and_then(|v| v.as_bool()).unwrap_or(false);
+
+                    if let (Some(x), Some(y), Some(w), Some(h)) = (x, y, w, h) {
+                        // Sanity check: only restore if size is reasonable
+                        if w >= 200 && h >= 150 {
+                            info!("Restoring window geometry: {}x{} at ({}, {}), maximized={}", w, h, x, y, maximized);
+                            let _ = win.set_position(tauri::PhysicalPosition::new(x, y));
+                            let _ = win.set_size(tauri::PhysicalSize::new(w, h));
+                        }
                     }
-                }
-                if maximized {
-                    info!("Restoring maximized state");
-                    let _ = win.maximize();
+                    if maximized {
+                        info!("Restoring maximized state");
+                        let _ = win.maximize();
+                    }
                 }
             }
 
             // ── Debounced geometry save on move/resize ──
-            let debounce_timer: std::sync::Arc<Mutex<Option<std::time::Instant>>> =
-                std::sync::Arc::new(Mutex::new(None));
+            let debounce_timer: Arc<Mutex<Option<std::time::Instant>>> =
+                Arc::new(Mutex::new(None));
 
             // Save geometry on move
             let app_handle = app.handle().clone();
@@ -714,6 +1200,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             // Server
             check_server_connectivity,
+            cancel_server_connectivity,
             save_server_url,
             get_saved_server,
             navigate_to_server,
@@ -739,13 +1226,23 @@ pub fn run() {
             system_restart,
             system_debug_info,
             system_check_for_updates,
+            system_network_addresses,
             // Power
             power_set_screensaver_enabled,
+            // Taskbar
+            taskbar_set_progress,
+            taskbar_set_state,
             // Media Controls
             media_notify_playback_state,
             media_notify_metadata,
             media_notify_stop,
             media_notify_position,
+            media_notify_duration,
+            media_notify_volume,
+            media_notify_rate,
+            media_notify_shuffle,
+            media_notify_repeat,
+            media_notify_queue,
             // Logging
             log_from_webview,
         ])
