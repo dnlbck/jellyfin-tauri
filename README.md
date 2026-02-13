@@ -13,7 +13,7 @@ A lightweight Jellyfin desktop client built with Tauri v2 + WebView2, designed t
 ┌──────────────────────────────────────────────────┐
 │  jellyfin-web (loaded from user's server)        │
 │  ┌────────────────────────────────────────────┐  │
-│  │  injection.js (initialization_script)       │  │
+│  │  injection.js (initialization_script)      │  │
 │  │  - window.api shim (Tauri IPC)             │  │
 │  │  - window.NativeShell.AppHost              │  │
 │  │  - window.jmpInfo (settings + metadata)    │  │
@@ -33,7 +33,7 @@ A lightweight Jellyfin desktop client built with Tauri v2 + WebView2, designed t
 │  - Window management + geometry save/restore     │
 │  - Power management (Win: SetThreadExecState,    │
 │    Linux: D-Bus org.freedesktop.ScreenSaver)     │
-│  - OS media controls (souvlaki: SMTC / MPRIS)   │
+│  - OS media controls (souvlaki: SMTC / MPRIS)    │
 │  - Taskbar progress (Win: ITaskbarList3 COM)     │
 │  - Network interface enumeration                 │
 │  - Single-instance enforcement                   │
