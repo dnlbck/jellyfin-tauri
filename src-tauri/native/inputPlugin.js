@@ -298,6 +298,9 @@
             on('playbackstart', (_e, state) => {
                 api.player.notifyPlaybackState('Playing');
 
+                // Inhibit screensaver during playback
+                api.power.setScreensaverEnabled(false);
+
                 // Helper: safely resolve the current item
                 const resolveItem = () => {
                     if (state && state.item) return state.item;
@@ -331,6 +334,13 @@
 
                 if (item) {
                     notifyMeta(item);
+                    // Update window title with current media name
+                    try {
+                        const title = item.SeriesName
+                            ? `${item.SeriesName} - ${item.Name} — Jellyfin Desktop`
+                            : `${item.Name || 'Playing'} — Jellyfin Desktop`;
+                        api.window.setTitle(title).catch(() => {});
+                    } catch (_) {}
                 } else {
                     // Player not registered yet — retry a few times with back-off
                     let retries = 0;
@@ -369,6 +379,12 @@
                 api.player.notifyPlaybackStop(false);
                 this._stopPositionInterval();
                 this._lastPositionMs = 0;
+
+                // Re-enable screensaver when playback stops
+                api.power.setScreensaverEnabled(true);
+
+                // Restore default window title
+                api.window.setTitle('Jellyfin Desktop').catch(() => {});
             });
 
             // --- volumechange ---
@@ -452,6 +468,11 @@
         destroy() {
             document.removeEventListener('keydown', this._boundKeyHandler, true);
             this._stopPositionInterval();
+
+            // Re-enable screensaver on cleanup
+            try {
+                window.api.power.setScreensaverEnabled(true);
+            } catch (_) {}
 
             // Unsubscribe from OS media control events
             if (this._unlistenMediaControl) {

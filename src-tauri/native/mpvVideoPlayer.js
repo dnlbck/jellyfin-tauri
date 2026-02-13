@@ -237,7 +237,26 @@
             } else if (dashboard && dashboard.setBackdropTransparency) {
                 this.setTransparency = dashboard.setBackdropTransparency.bind(dashboard);
             } else {
-                this.setTransparency = () => {};
+                // Robust DOM-based fallback: directly manipulate backdrop CSS classes
+                // when jellyfin-web's dashboard binding isn't available
+                this.setTransparency = (level) => {
+                    const docEl = document.documentElement;
+                    const bgContainer = document.querySelector('.backgroundContainer');
+                    const backdropContainer = document.querySelector('.backdropContainer');
+                    if (level === 'full' || level === 2) {
+                        docEl.classList.add('transparentDocument');
+                        if (bgContainer) bgContainer.classList.add('backgroundContainer-transparent');
+                        if (backdropContainer) backdropContainer.classList.add('hide');
+                    } else if (level === 'backdrop' || level === 1) {
+                        docEl.classList.add('transparentDocument');
+                        if (bgContainer) bgContainer.classList.add('backgroundContainer-transparent');
+                        if (backdropContainer) backdropContainer.classList.add('hide');
+                    } else {
+                        docEl.classList.remove('transparentDocument');
+                        if (bgContainer) bgContainer.classList.remove('backgroundContainer-transparent');
+                        if (backdropContainer) backdropContainer.classList.remove('hide');
+                    }
+                };
             }
 
             this.name = 'MPV Video Player';
@@ -309,7 +328,11 @@
 
                     const dlg = this._videoDialog;
                     if (dlg) {
+                        // Clear the backdrop placeholder image
                         dlg.style.backgroundImage = '';
+                        // MPV is now rendering behind the WebView — make overlay transparent
+                        // so the native video shows through
+                        dlg.style.backgroundColor = 'transparent';
                     }
 
                     if (this._currentPlayOptions.fullscreen) {
@@ -1218,8 +1241,10 @@
                 dlg.style.right = '0';
                 dlg.style.display = 'flex';
                 dlg.style.alignItems = 'center';
-                // Make transparent so MPV video shows through behind WebView
-                dlg.style.backgroundColor = 'transparent';
+                // Start with BLACK background to hide the Jellyfin UI while MPV loads.
+                // Once MPV renders its first frame (onPlaying), we switch to transparent
+                // so the native MPV video shows through the WebView.
+                dlg.style.backgroundColor = '#000';
 
                 if (options.fullscreen) {
                     dlg.style.zIndex = '1000';
@@ -1249,7 +1274,15 @@
                 }
             } else {
                 this._videoDialog = dlg;
+                // Reset to black background for the new playback loading phase
+                dlg.style.backgroundColor = '#000';
+                if (options.backdropUrl) {
+                    dlg.style.backgroundImage = `url('${options.backdropUrl}')`;
+                    dlg.style.backgroundSize = 'cover';
+                    dlg.style.backgroundPosition = 'center';
+                }
                 if (options.fullscreen) {
+                    dlg.style.zIndex = '1000';
                     document.body.classList.add('hide-scroll');
                 }
             }

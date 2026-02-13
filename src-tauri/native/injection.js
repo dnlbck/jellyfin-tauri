@@ -298,6 +298,7 @@
             raise:           ()        => invoke('window_raise'),
             setCursorVisible:(visible) => invoke('window_set_cursor_visible', { visible }),
             saveGeometry:    ()        => invoke('window_save_geometry'),
+            setTitle:        (title)   => invoke('window_set_title', { title }),
         },
     };
 

@@ -243,6 +243,14 @@ async fn settings_get_all(app: AppHandle, section: String) -> Result<Value, Stri
 // ========================================================================
 
 #[tauri::command]
+async fn window_set_title(app: AppHandle, title: String) -> Result<(), String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or("Main window not found")?;
+    window.set_title(&title).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn window_set_fullscreen(app: AppHandle, fullscreen: bool) -> Result<(), String> {
     let window = app
         .get_webview_window("main")
@@ -716,6 +724,7 @@ pub fn run() {
             settings_delete_section,
             settings_get_all,
             // Window
+            window_set_title,
             window_set_fullscreen,
             window_is_fullscreen,
             window_set_always_on_top,
