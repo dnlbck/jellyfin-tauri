@@ -138,8 +138,12 @@ async fn navigate_to_server(app: AppHandle, url: String) -> Result<(), String> {
 
     let nav_url = format!("{}/web/index.html", url.trim_end_matches('/'));
     info!("Navigating webview to: {}", nav_url);
+    let parsed: tauri::Url = nav_url.parse().map_err(|e| {
+        error!("Failed to parse navigation URL: {}", e);
+        format!("Invalid URL: {}", e)
+    })?;
     webview
-        .eval(&format!("window.location.href = '{}';", nav_url))
+        .navigate(parsed)
         .map_err(|e| {
             error!("Failed to navigate webview: {}", e);
             e.to_string()
@@ -1066,8 +1070,8 @@ pub fn run() {
                                 MediaControlEvent::Play => "play",
                                 MediaControlEvent::Pause => "pause",
                                 MediaControlEvent::Toggle => "play_pause",
-                                MediaControlEvent::Next => "next",
-                                MediaControlEvent::Previous => "previous",
+                                MediaControlEvent::Next => "next_track",
+                                MediaControlEvent::Previous => "previous_track",
                                 MediaControlEvent::Stop => "stop",
                                 MediaControlEvent::Seek(SeekDirection::Forward) => "seek_forward",
                                 MediaControlEvent::Seek(SeekDirection::Backward) => "seek_backward",

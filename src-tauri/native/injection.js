@@ -217,7 +217,7 @@
             stateChanged:        createSignal('player-state-changed'),
             videoPlaybackActive: createSignal('player-video-playback-active'),
             windowVisible:       createSignal('player-window-visible'),
-            onVideoRecangleChanged: createSignal('player-video-rectangle-changed'),
+            onVideoRectangleChanged: createSignal('player-video-rectangle-changed'),
             onMetaData:          createSignal('player-metadata'),
         },
 
@@ -656,7 +656,7 @@
         resetServerBtn.style.cssText = 'background:#833;color:#fff;border:none;border-radius:4px;padding:8px 18px;cursor:pointer;font-size:0.95em;';
         resetServerBtn.addEventListener('click', async () => {
             if (confirm('Clear saved server URL and restart?')) {
-                await invoke('settings_set_value', { section: 'server', key: 'server_url', value: null });
+                await invoke('save_server_url', { url: '' });
                 await invoke('system_restart');
             }
         });
@@ -727,7 +727,7 @@
                     AudioCodec: 'aac',
                     Context: 'Streaming',
                     Protocol: 'hls',
-                    MaxAudioChannels: maxCh === '2' ? '2' : '2',
+                    MaxAudioChannels: maxCh,
                 },
             ],
 
@@ -953,10 +953,18 @@
 
                 // Listen for settings changes from Rust
                 api.settings.settingsValue.connect((data) => {
-                    if (data && data.section === 'main' && data.key && data.value !== undefined) {
-                        // Update without triggering proxy set (avoid loop)
-                        const raw = Object.assign({}, window.jmpInfo.settings.main);
-                        raw[data.key] = data.value;
+                    if (data && data.key && data.value !== undefined && data.section) {
+                        // Update the underlying proxy target without triggering the set trap
+                        // by checking if the section settings object exists
+                        const sectionSettings = window.jmpInfo.settings[data.section];
+                        if (sectionSettings) {
+                            Reflect.defineProperty(sectionSettings, data.key, {
+                                value: data.value,
+                                writable: true,
+                                enumerable: true,
+                                configurable: true,
+                            });
+                        }
                     }
                 });
 

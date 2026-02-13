@@ -33,12 +33,12 @@ document.addEventListener("DOMContentLoaded", async () => {
     statusMsg.className = "status info";
 
     try {
-      const result = await invoke<{ name: string; version: string; id: string }>(
+      const result = await invoke<{ ServerName: string; Version: string; Id: string }>(
         "check_server_connectivity",
         { url }
       );
 
-      statusMsg.textContent = `Connected to ${result.name} (v${result.version})`;
+      statusMsg.textContent = `Connected to ${result.ServerName} (v${result.Version})`;
       statusMsg.className = "status success";
 
       // Save server URL

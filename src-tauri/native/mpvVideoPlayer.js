@@ -940,6 +940,9 @@
             // Ensure MPV is initialized (video mode)
             await mpv.ensureInit(false);
 
+            // Reset vid to auto in case audio player set it to 'no'
+            await mpv.setProperty('vid', 'auto');
+
             // Apply audio configuration settings (device, passthrough, channels, etc.)
             try {
                 await this._applyAudioSettings();
@@ -1100,8 +1103,10 @@
             }
             const streams = this._currentPlayOptions?.mediaSource?.MediaStreams || [];
             const stream = this.getStreamByIndex(streams, index);
-            if (stream && stream.DeliveryMethod === 'External' && stream.DeliveryUrl) {
-                mpv.command('sub-add', [stream.DeliveryUrl, 'auto']).then(() => {
+            const secIsExternal = stream && (stream._originalIsExternal ?? stream.IsExternal);
+            const secDeliveryUrl = stream && (stream._originalDeliveryUrl ?? stream.DeliveryUrl);
+            if (secIsExternal && secDeliveryUrl) {
+                mpv.command('sub-add', [secDeliveryUrl, 'auto']).then(() => {
                     mpv.getProperty('track-list/count', 'int64').then(count => {
                         mpv.setProperty('secondary-sid', String(count)).catch(() => {});
                     }).catch(() => {});
@@ -1596,6 +1601,7 @@
                     // panscan=1 fills the window, cropping edges
                     mpv.setProperty('video-aspect-override', '-1');
                     mpv.setProperty('panscan', '1.0');
+                    mpv.setProperty('keepaspect', true);
                     break;
                 case 'fill':
                     // Stretch to fill (ignore original aspect)
